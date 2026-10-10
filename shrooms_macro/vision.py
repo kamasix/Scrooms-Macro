@@ -1,0 +1,865 @@
+"""Visual recognition of Shrooms controls, using only captured window pixels.
+
+All output coordinates are physical pixels relative to the captured client area.
+Regions in configuration are normalized ``[x, y, width, height]`` rectangles.
+No moving gameplay target is searched outside its configured gameplay region.
+"""
+
+from __future__ import annotations
+
+import math
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import cv2
+import numpy as np
+
+
+Box = tuple[int, int, int, int]
+TAU = math.tau
+
+
+@dataclass(frozen=True)
+class Match:
+    x: float
+    y: float
+    score: float
+    box: Box
+
+
+@dataclass(frozen=True)
+class BarTrack:
+    region: Box
+    marker: float
+    zone_low: float
+    zone_high: float
+    axis: str
+    confidence: float
+    center: tuple[float, float] | None = None
+    radius: float = 0.0
+    marker_low: float | None = None
+    marker_high: float | None = None
+    marker_overlap: bool = False
+    zone_observed: bool = True
+    outline_radius: float = 0.0
+
+    @property
+    def zone_size(self) -> float:
+        return (self.zone_high - self.zone_low) % TAU if self.axis == "angle" else self.zone_high - self.zone_low
+
+    @property
+    def zone_angle(self) -> float:
+        return (self.zone_low + self.zone_size / 2.0) % TAU
+
+    @property
+    def zone_center(self) -> tuple[float, float]:
+        x, y, w, h = self.region
+        if self.axis == "angle":
+            cx, cy = self.center or (x + w / 2.0, y + h / 2.0)
+            return (cx + self.radius * math.cos(self.zone_angle), cy + self.radius * math.sin(self.zone_angle))
+        midpoint = (self.zone_low + self.zone_high) / 2.0
+        return (x + midpoint * w, y + h / 2.0) if self.axis == "x" else (x + w / 2.0, y + midpoint * h)
+
+    @property
+    def marker_point(self) -> tuple[float, float]:
+        x, y, w, h = self.region
+        if self.axis == "angle":
+            cx, cy = self.center or (x + w / 2.0, y + h / 2.0)
+            return (cx + self.radius * math.cos(self.marker), cy + self.radius * math.sin(self.marker))
+        return (x + self.marker * w, y + h / 2.0) if self.axis == "x" else (x + w / 2.0, y + self.marker * h)
+
+
+@dataclass(frozen=True)
+class TuneTrack:
+    target_x: float
+    marker_x: float
+    region: Box
+    confidence: float
+    y: float
+
+    @property
+    def x(self) -> float:
+        return self.target_x
+
+
+@dataclass(frozen=True)
+class TargetTrack:
+    x: float
+    y: float
+    confidence: float
+    region: Box
+    control_x: float | None = None
+    control_width: float | None = None
+    cursor_x: float | None = None
+    progress: float | None = None
+    goal_left: float | None = None
+    goal_right: float | None = None
+    goal_top: float | None = None
+    goal_bottom: float | None = None
+    cursor_y: float | None = None
+
+
+@dataclass(frozen=True)
+class Observation:
+    charge: BarTrack | None = None
+    frequency: TargetTrack | None = None
+    success: bool = False
+    sell: Match | None = None
+    confirm: Match | None = None
+    tuning: TuneTrack | None = None
+    catch_present: bool = False
+    catch_progress: float | None = None
+    ring_present: bool = False
+    ring_diagnostic: str = ""
+
+
+def crop_region(frame: np.ndarray, region: Any) -> tuple[np.ndarray, Box]:
+    """Clip a normalized region safely; malformed regions produce an empty crop."""
+    empty = np.empty((0, 0, 3), dtype=np.uint8)
+    if not isinstance(frame, np.ndarray) or frame.ndim < 2:
+        return empty, (0, 0, 0, 0)
+    height, width = frame.shape[:2]
+    try:
+        values = np.asarray(region, dtype=float)
+        if values.shape != (4,) or not np.all(np.isfinite(values)) or values[2] <= 0 or values[3] <= 0:
+            return empty, (0, 0, 0, 0)
+        x, y, w, h = values
+        left = max(0, min(width, int(math.floor(x * width))))
+        top = max(0, min(height, int(math.floor(y * height))))
+        right = max(0, min(width, int(math.ceil((x + w) * width))))
+        bottom = max(0, min(height, int(math.ceil((y + h) * height))))
+    except (TypeError, ValueError, OverflowError):
+        return empty, (0, 0, 0, 0)
+    if right <= left or bottom <= top:
+        return empty, (left, top, 0, 0)
+    return frame[top:bottom, left:right], (left, top, right - left, bottom - top)
+
+
+def load_image(path: Path) -> np.ndarray | None:
+    """OpenCV's normal file reader does not support all Windows Unicode paths."""
+    try:
+        raw = np.fromfile(path, dtype=np.uint8)
+        if raw.size == 0:
+            return None
+        result = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+        return result if result is not None and result.size else None
+    except (OSError, ValueError, cv2.error):
+        return None
+
+
+def _number(value: Any, default: float) -> float:
+    try:
+        result = float(value)
+        return result if math.isfinite(result) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _white(image: np.ndarray, value: int = 185) -> np.ndarray:
+    b, g, r = cv2.split(image)
+    low = cv2.min(cv2.min(b, g), r)
+    high = cv2.max(cv2.max(b, g), r)
+    return cv2.bitwise_and(cv2.compare(low, value, cv2.CMP_GE), cv2.compare(cv2.subtract(high, low), 65, cv2.CMP_LE))
+
+
+def _components(mask: np.ndarray, minimum: int = 3) -> list[tuple[Box, int, float, float]]:
+    if mask.size == 0 or not np.any(mask):
+        return []
+    count, _, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
+    found = []
+    for i in range(1, count):
+        x, y, w, h, area = (int(v) for v in stats[i])
+        if area >= minimum:
+            found.append(((x, y, w, h), area, float(centroids[i, 0]), float(centroids[i, 1])))
+    return found
+
+
+def _runs(values: np.ndarray) -> list[tuple[int, int]]:
+    padded = np.pad(values.astype(np.int8), (1, 1))
+    changes = np.diff(padded)
+    return list(zip(np.flatnonzero(changes == 1).tolist(), np.flatnonzero(changes == -1).tolist()))
+
+
+def _circular_interval(angles: np.ndarray) -> tuple[float, float, float]:
+    center = math.atan2(float(np.sin(angles).mean()), float(np.cos(angles).mean())) % TAU
+    relative = (angles - center + math.pi) % TAU - math.pi
+    low, high = np.quantile(relative, [0.03, 0.97])
+    return (center + float(low)) % TAU, (center + float(high)) % TAU, center
+
+
+@dataclass
+class _Template:
+    image: np.ndarray
+    feature: np.ndarray
+    mode: str
+    stamp: tuple[int, int]
+
+
+class Detector:
+    def __init__(self, config: dict, assets_dir: Path) -> None:
+        self.config = config
+        self.assets_dir = Path(assets_dir)
+        self.templates: dict[str, _Template] = {}
+        self._scaled: dict[tuple[str, int, int], np.ndarray] = {}
+        self._last_reload = -math.inf
+        self._ring_geometry: tuple[tuple[int, int, int, int], float, float, float] | None = None
+        self._ring_zone: tuple[Box, float, float, float] | None = None
+        self._last_ring_present = False
+        self._last_ring_diagnostic = ""
+        self._ring_used_cached_geometry = False
+        self._last_geometry_retry = -math.inf
+        self._scan_cache: dict[str, tuple[float, Match | None]] = {}
+        self._features: dict[tuple[Any, ...], np.ndarray] = {}
+        self._refresh_templates(force=True)
+
+    def _refresh_templates(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._last_reload < 0.75:
+            return
+        self._last_reload = now
+        for name in ("sell", "confirm", "success", "tune_prompt", "catch_target", "frequency_target"):
+            path = self.assets_dir / f"{name}.png"
+            try:
+                stat = path.stat()
+                stamp = (stat.st_mtime_ns, stat.st_size)
+            except OSError:
+                self.templates.pop(name, None)
+                continue
+            previous = self.templates.get(name)
+            if previous is not None and previous.stamp == stamp:
+                continue
+            image = load_image(path)
+            if image is None or min(image.shape[:2]) < 3:
+                self.templates.pop(name, None)
+                continue
+            # Text/silhouette masks exclude scenery and translucent panel colors.
+            feature = (_white(image, 160).astype(np.float32) / 255.0)
+            mode = "white"
+            if feature.std() < 0.06:
+                if name != "frequency_target":
+                    self.templates.pop(name, None)
+                    continue
+                feature = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+                mode = "gray"
+            if feature.std() < 0.035:
+                self.templates.pop(name, None)
+                continue
+            self.templates[name] = _Template(image, feature, mode, stamp)
+            self._scaled = {key: value for key, value in self._scaled.items() if key[0] != name}
+            self._scan_cache.pop(name, None)
+
+    def ready(self) -> list[str]:
+        """Return missing setup items, without initiating any desktop actions."""
+        self._refresh_templates(force=True)
+        missing = []
+        for key, label in (("charge_region", "Perfect ring"), ("tuning_region", "tuning control"), ("frequency_region", "catch control")):
+            test, _ = crop_region(np.zeros((100, 100, 3), dtype=np.uint8), self.config.get(key))
+            if test.size == 0:
+                missing.append(f"Set region: {label}")
+        if "tune_prompt" not in self.templates:
+            missing.append("Tuning prompt template is missing")
+        progress_crop, _ = crop_region(np.zeros((100, 100, 3), dtype=np.uint8), self.config.get("progress_region"))
+        if "success" not in self.templates and progress_crop.size == 0:
+            missing.append("Set the progress bar or a catch confirmation template")
+        if "sell" not in self.templates:
+            missing.append("Sell All template is missing")
+        return missing
+
+    def _frame_feature(self, frame: np.ndarray, mode: str, box: Box) -> np.ndarray:
+        key = (mode, *box)
+        if key not in self._features:
+            x, y, w, h = box
+            crop = frame[y:y + h, x:x + w]
+            self._features[key] = (_white(crop, 160).astype(np.float32) / 255.0) if mode == "white" else cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        return self._features[key]
+
+    def _scales(self, name: str, frame: np.ndarray) -> list[float]:
+        resolutions = self.config.get("template_source_resolutions", {})
+        source = resolutions.get(name, self.config.get("source_resolution", (1919, 1079))) if isinstance(resolutions, dict) else (1919, 1079)
+        try:
+            sw, sh = float(source[0]), float(source[1])
+            if sw <= 0 or sh <= 0:
+                raise ValueError
+        except (TypeError, ValueError, IndexError):
+            sw, sh = 1919.0, 1079.0
+        h, w = frame.shape[:2]
+        # Roblox interfaces commonly scale with viewport height. Also cover
+        # width scaling and the minor difference in cropped source screenshots.
+        bases = {h / sh, w / sw}
+        return sorted({round(base * variation, 3) for base in bases for variation in (0.90, 0.96, 1.0, 1.04, 1.10) if 0.08 <= base * variation <= 6.0})
+
+    def _match_in(self, frame: np.ndarray, name: str, box: Box, reduction: float = 1.0) -> Match | None:
+        template = self.templates.get(name)
+        if template is None:
+            return None
+        x, y, w, h = box
+        if w < 3 or h < 3:
+            return None
+        haystack = self._frame_feature(frame, template.mode, box)
+        if reduction < 1.0:
+            haystack = cv2.resize(haystack, (max(3, round(w * reduction)), max(3, round(h * reduction))), interpolation=cv2.INTER_AREA)
+        sx, sy = w / haystack.shape[1], h / haystack.shape[0]
+        threshold = _number(self.config.get(f"{name}_threshold"), 0.82 if name == "success" else 0.76)
+        threshold = max(0.55, min(0.995, threshold))
+        best: Match | None = None
+        for scale in self._scales(name, frame):
+            th, tw = template.feature.shape[:2]
+            tw, th = max(3, round(tw * scale / sx)), max(3, round(th * scale / sy))
+            if tw > haystack.shape[1] or th > haystack.shape[0]:
+                continue
+            key = (name, tw, th)
+            needle = self._scaled.get(key)
+            if needle is None:
+                needle = cv2.resize(template.feature, (tw, th), interpolation=cv2.INTER_AREA)
+                if needle.std() < 0.035:
+                    continue
+                if len(self._scaled) >= 240:
+                    self._scaled.pop(next(iter(self._scaled)))
+                self._scaled[key] = needle
+            result = cv2.matchTemplate(haystack, needle, cv2.TM_CCOEFF_NORMED)
+            np.nan_to_num(result, copy=False, nan=-1.0, posinf=-1.0, neginf=-1.0)
+            _, score, _, location = cv2.minMaxLoc(result)
+            if score < threshold or (best is not None and score <= best.score):
+                continue
+            hx, hy = location
+            if template.mode == "white":
+                patch = haystack[hy:hy + th, hx:hx + tw]
+                foreground = needle > 0.45
+                if np.count_nonzero(foreground) < 4 or float((patch[foreground] > 0.30).mean()) < 0.62:
+                    continue
+            bx, by = round(x + hx * sx), round(y + hy * sy)
+            bw, bh = max(1, round(tw * sx)), max(1, round(th * sy))
+            best = Match(bx + bw / 2.0, by + bh / 2.0, float(score), (bx, by, bw, bh))
+        return best
+
+    def _match(self, frame: np.ndarray, name: str, now: float, only_box: Box | None = None) -> Match | None:
+        if name not in self.templates:
+            return None
+        if only_box is not None:
+            return self._match_in(frame, name, only_box)
+        regions = self.config.get("template_regions", {})
+        region = regions.get(name) if isinstance(regions, dict) else None
+        local_box = None
+        if region is not None:
+            try:
+                x, y, w, h = [float(v) for v in region]
+                _, local_box = crop_region(frame, (x - w * 0.35, y - h * 0.6, w * 1.7, h * 2.2))
+            except (TypeError, ValueError):
+                pass
+            if local_box is not None:
+                local = self._match_in(frame, name, local_box)
+                if local is not None:
+                    self._scan_cache[name] = (now, local)
+                    return local
+        cached = self._scan_cache.get(name)
+        interval = 0.55 if local_box is not None else 0.18
+        if cached is not None and 0 <= now - cached[0] < interval:
+            # A failed calibrated-area check invalidates a previously found
+            # button immediately, so input never follows stale coordinates.
+            return None if local_box is not None else cached[1]
+        h, w = frame.shape[:2]
+        reduction = min(1.0, 1100.0 / max(w, h))
+        match = self._match_in(frame, name, (0, 0, w, h), reduction)
+        self._scan_cache[name] = (now, match)
+        return match
+
+    @staticmethod
+    def _outline_score(crop: np.ndarray, cx: float, cy: float, radius: float) -> float:
+        """A UI ring is a dark annulus with brighter pixels on both sides.
+
+        Sampling its whole circumference verifies the circle independently of
+        the green target and white pointer. A solid dark scene object does not
+        have the required brighter circular interior.
+        """
+        h, w = crop.shape[:2]
+        angles = np.linspace(0.0, TAU, 120, endpoint=False)
+        radii = np.array((0.60, 0.86, 1.14))[:, None]
+        mx = (cx + radii * radius * np.cos(angles)).astype(np.float32)
+        my = (cy + radii * radius * np.sin(angles)).astype(np.float32)
+        valid = ((mx >= 1) & (mx < w - 1) & (my >= 1) & (my < h - 1)).all(axis=0)
+        if np.count_nonzero(valid) < 54:
+            return 0.0
+        values = cv2.remap(crop, mx, my, cv2.INTER_LINEAR).max(axis=2).astype(np.int16)
+        middle = values[1]
+        ring = (middle < 115) & (values[0] - middle > 12) & (values[2] - middle > 12)
+        dark_fraction = float((middle[valid] < 115).mean())
+        if dark_fraction < 0.65:
+            return 0.0
+        return float(ring[valid].mean())
+
+    def _ring_outline(self, crop: np.ndarray, region: Box, *, force: bool = False) -> float | None:
+        _, _, w, h = region
+        previous = self._ring_geometry
+        self._ring_used_cached_geometry = False
+        if not force and previous is not None and previous[0] == region:
+            _, cx, cy, radius = self._ring_geometry
+            score = self._outline_score(crop, cx, cy, radius)
+            if score >= 0.55:
+                self._ring_used_cached_geometry = True
+                return score
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, 1.0, min(w, h) * 0.20,
+                                   param1=80, param2=25, minRadius=round(min(w, h) * 0.25), maxRadius=round(min(w, h) * 0.57))
+        best = None
+        if circles is not None:
+            for proposed in circles[0]:
+                cx, cy, proposed_radius = (float(v) for v in proposed)
+                for radius in (proposed_radius, proposed_radius / 0.75, proposed_radius * 0.75):
+                    if not min(w, h) * 0.25 <= radius <= min(w, h) * 0.59:
+                        continue
+                    score = self._outline_score(crop, cx, cy, radius)
+                    if score >= 0.55 and (best is None or score > best[0]):
+                        best = (score, cx, cy, radius)
+        if best is None:
+            # A failed retry must not discard a currently verified ring or its
+            # complete Perfect arc merely because the pointer occludes edges.
+            if not force:
+                self._ring_geometry = None
+                self._ring_zone = None
+            return None
+        score, cx, cy, radius = best
+        if previous is not None:
+            same_region = previous[0] == region
+            center_shift = math.hypot(cx - previous[1], cy - previous[2])
+            radius_shift = abs(radius - previous[3])
+            if (not same_region or center_shift > max(1.5, radius * 0.02)
+                    or radius_shift > max(1.5, radius * 0.025)):
+                # Angular targets belong to their measured circle. A changed
+                # center/radius cannot reuse angles from the previous geometry.
+                self._ring_zone = None
+        self._ring_geometry = (region, cx, cy, radius)
+        return score
+
+    def _ring(self, crop: np.ndarray, region: Box, now: float | None = None) -> BarTrack | None:
+        now = time.monotonic() if now is None else now
+        self._last_ring_diagnostic = ""
+
+        def unavailable(reason: str) -> None:
+            self._last_ring_diagnostic = reason
+            return None
+
+        x, y, w, h = region
+        if min(w, h) < 35:
+            return None
+        outline_score = self._ring_outline(crop, region)
+        self._last_ring_present = outline_score is not None
+        if outline_score is None:
+            return None
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        green = cv2.inRange(hsv, np.array((50, 170, 190)), np.array((95, 255, 255)))
+        cached = self._ring_zone
+        recent_zone = cached is not None and cached[0] == region and 0 <= now - cached[3] <= 0.25
+        green_count = np.count_nonzero(green)
+        if green_count < max(8, w * h * 0.001) and not recent_zone:
+            return unavailable("Perfect target not detected")
+        _, cx, cy, radius = self._ring_geometry
+        yy, xx = np.indices((h, w), dtype=np.float32)
+        distance = np.hypot(xx - cx, yy - cy)
+        annulus = (distance >= radius * 0.75) & (distance <= radius * 1.03)
+        greens = (green > 0) & annulus
+        components = _components(greens.astype(np.uint8) * 255, max(6, round(radius * 0.08)))
+        observed_zone = None
+        if components:
+            zone = max(components, key=lambda item: item[1])
+            zx, zy, zw, zh = zone[0]
+            zone_mask = np.zeros((h, w), dtype=bool)
+            zone_mask[zy:zy + zh, zx:zx + zw] = greens[zy:zy + zh, zx:zx + zw]
+            angles = np.arctan2(yy[zone_mask] - cy, xx[zone_mask] - cx) % TAU
+            low, high, _ = _circular_interval(angles)
+            if 0.015 <= (high - low) % TAU <= 0.65:
+                observed_zone = (low, high)
+        if observed_zone is None and not recent_zone:
+            return unavailable("Perfect target not detected on the ring")
+        marker_color = self.config.get("charge_marker_color", (245, 245, 245))
+        try:
+            sample = np.asarray(marker_color, dtype=float)
+            if sample.shape != (3,) or not np.all(np.isfinite(sample)):
+                raise ValueError
+            sample = np.clip(sample, 0, 255).astype(np.uint8)
+            if int(sample.max()) - int(sample.min()) <= 65:
+                marker_mask = _white(crop, max(140, round(float(sample.min()) * 0.84)))
+            else:
+                lower = np.clip(sample.astype(np.int16) - 55, 0, 255).astype(np.uint8)
+                upper = np.clip(sample.astype(np.int16) + 55, 0, 255).astype(np.uint8)
+                marker_mask = cv2.inRange(crop, lower, upper)
+        except (TypeError, ValueError):
+            marker_mask = _white(crop, 205)
+        whites = (marker_mask > 0) & annulus
+        candidates = []
+        for box, area, mx, my in _components(whites.astype(np.uint8) * 255, max(6, round(radius * 0.07))):
+            bx, by, bw, bh = box
+            component = whites[by:by + bh, bx:bx + bw]
+            ay, ax = np.nonzero(component)
+            angles = np.arctan2(ay + by - cy, ax + bx - cx) % TAU
+            ml, mh, angle = _circular_interval(angles)
+            radial_values = distance[by:by + bh, bx:bx + bw][component]
+            radial_low, radial_high = np.quantile(radial_values, (0.05, 0.95))
+            span = (mh - ml) % TAU
+            if (0.035 <= span <= 0.35 and radius * 0.08 <= radial_high - radial_low <= radius * 0.35
+                    and radius * radius * 0.004 <= area <= radius * radius * 0.07):
+                candidates.append((area, angle, span, ml, mh))
+        if len(candidates) != 1:
+            # Ambiguous bright fragments cannot authorize an input. The
+            # independently verified ring remains present, so the engine waits.
+            return unavailable("White pointer not detected" if not candidates else f"Multiple white pointer candidates ({len(candidates)})")
+        # A ring also needs a dark annulus; isolated bright scenery cannot
+        # qualify merely by having green and white pixels in this rectangle.
+        dark_fraction = float((hsv[:, :, 2][annulus] < 115).mean())
+        if dark_fraction < 0.35:
+            return unavailable("Dark ring interior not verified")
+        _, marker, marker_width, marker_low, marker_high = max(candidates)
+        if recent_zone:
+            old_low, old_high = cached[1], cached[2]
+            old_size = (old_high - old_low) % TAU
+            old_center = (old_low + old_size / 2.0) % TAU
+            difference = abs((marker - old_center + math.pi) % TAU - math.pi)
+            covering_zone = difference <= (old_size + marker_width) / 2.0 + 0.03
+            if observed_zone is not None:
+                new_low, new_high = observed_zone
+                new_size = (new_high - new_low) % TAU
+                new_center = (new_low + new_size / 2.0) % TAU
+                center_shift = abs((new_center - old_center + math.pi) % TAU - math.pi)
+                # Preserve the complete target while the arrow hides any part
+                # of it, rather than chasing the exposed green remainder.
+                if covering_zone and center_shift + new_size / 2.0 <= old_size / 2.0 + 0.04:
+                    low, high = old_low, old_high
+                else:
+                    low, high = new_low, new_high
+                self._ring_zone = (region, low, high, now)
+            else:
+                lime = (hsv[:, :, 0] >= 25) & (hsv[:, :, 0] <= 49) & (hsv[:, :, 1] >= 120) & (hsv[:, :, 2] >= 150)
+                angle_grid = np.arctan2(yy - cy, xx - cx)
+                nearby = np.abs((angle_grid - old_center + math.pi) % TAU - math.pi) <= 0.45
+                if not covering_zone or np.count_nonzero(lime & annulus & nearby) < max(8, round(radius * 0.15)):
+                    return unavailable("Hidden Perfect target could not be verified")
+                low, high = old_low, old_high
+        else:
+            low, high = observed_zone
+            self._ring_zone = (region, low, high, now)
+        confidence = min(0.99, 0.78 + dark_fraction * 0.18)
+        overlap = (marker - low) % TAU <= (high - low) % TAU
+        return BarTrack(region, marker, low, high, "angle", confidence, (x + cx, y + cy), radius * 0.88,
+                        marker_low, marker_high, overlap, observed_zone is not None, radius)
+
+    def _linear_charge(self, crop: np.ndarray, region: Box) -> BarTrack | None:
+        _, _, w, h = region
+        axis = self.config.get("charge_axis", "x" if w >= h else "y")
+        axis = axis if axis in ("x", "y") else ("x" if w >= h else "y")
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        green = cv2.inRange(hsv, np.array((35, 110, 130)), np.array((95, 255, 255)))
+        length, cross = (w, h) if axis == "x" else (h, w)
+        zones = []
+        for box, area, cx, cy in _components(green):
+            bx, by, bw, bh = box
+            along, across = (bw, bh) if axis == "x" else (bh, bw)
+            if 0.004 * length <= along <= 0.42 * length and across >= 0.25 * cross:
+                zones.append((area, bx if axis == "x" else by, along))
+        markers = []
+        for box, area, cx, cy in _components(_white(crop, 190)):
+            _, _, bw, bh = box
+            along, across = (bw, bh) if axis == "x" else (bh, bw)
+            if along <= 0.18 * length and across >= 0.25 * cross:
+                markers.append((area, cx if axis == "x" else cy))
+        if not zones or not markers:
+            return None
+        _, begin, span = max(zones)
+        marker = max(markers)[1]
+        return BarTrack(region, marker / max(1, length - 1), begin / length, (begin + span) / length, axis, 0.82)
+
+    @staticmethod
+    def _round_marker(crop: np.ndarray, start: float, end: float) -> tuple[float, float] | None:
+        h, w = crop.shape[:2]
+        top, bottom = max(0, int(h * start)), min(h, int(h * end))
+        if bottom <= top:
+            return None
+        found = []
+        for box, area, cx, cy in _components(_white(crop[top:bottom], 215), 8):
+            _, _, bw, bh = box
+            if 0.55 <= bw / max(1, bh) <= 1.85 and 4 <= bw <= max(8, h * 0.40) and 4 <= bh <= max(8, h * 0.40):
+                if area / (bw * bh) >= 0.35:
+                    found.append((area, cx, cy + top))
+        if not found:
+            return None
+        _, cx, cy = max(found)
+        return cx, cy
+
+    def _tuning(self, frame: np.ndarray, now: float) -> TuneTrack | None:
+        crop, region = crop_region(frame, self.config.get("tuning_region"))
+        if crop.size == 0 or self._match(frame, "tune_prompt", now) is None:
+            return None
+        upper = self._round_marker(crop, 0.0, 0.37)
+        lower = self._round_marker(crop, 0.62, 0.99)
+        if upper is None or lower is None:
+            return None
+        x, y, _, _ = region
+        return TuneTrack(x + lower[0], x + upper[0], region, 0.92, y + upper[1])
+
+    def _progress(self, frame: np.ndarray) -> float | None:
+        crop, _ = crop_region(frame, self.config.get("progress_region"))
+        if crop.size == 0 or crop.shape[1] < 30 or crop.shape[0] < 5:
+            return None
+        h, w = crop.shape[:2]
+        high, low = crop.max(axis=2), crop.min(axis=2)
+        neutral = ((high.astype(np.int16) - low.astype(np.int16)) < 55) & (high > (60 if h <= 12 else 80))
+        # Thin neutral border at both ends of a wide rectangular progress bar.
+        top_coverage = neutral[:max(2, h // 3)].mean(axis=1).max()
+        bottom_coverage = neutral[-max(2, h // 3):].mean(axis=1).max()
+        if top_coverage < 0.70 or bottom_coverage < 0.70:
+            return None
+        bright = _white(crop[max(1, h // 4):max(2, h * 3 // 4)], 190) > 0
+        columns = bright.mean(axis=0) >= 0.45
+        filled = _runs(columns)
+        start_limit = max(6, int(w * 0.025))
+        leading = [run for run in filled if run[0] <= start_limit]
+        if not leading:
+            return 0.0
+        start, finish = max(leading, key=lambda run: run[1] - run[0])
+        return float(np.clip((finish - start) / max(1, w - 4), 0.0, 1.0))
+
+    def _catch_presence(self, frame: np.ndarray, progress: float | None) -> bool:
+        """Detect the catch UI independently of its moving or occluded target."""
+        crop, _ = crop_region(frame, self.config.get("frequency_region"))
+        if progress is None or crop.size == 0 or crop.shape[0] < 10:
+            return False
+        h = crop.shape[0]
+        rows = (_white(crop, 150) > 0).mean(axis=1)
+        span = max(4, h // 5)
+        # UI borders are thin lines separated by a mostly translucent area.
+        # A white flash or a blank white window is not a finished catch UI.
+        middle = rows[span:-span]
+        return bool(middle.size and np.median(middle) < 0.85 and rows[:span].max() >= 0.65 and rows[-span:].max() >= 0.65)
+
+    @staticmethod
+    def _catch_bar_limits(crop: np.ndarray) -> tuple[int, int] | None:
+        h = crop.shape[0]
+        rows = (_white(crop, 150) > 0).mean(axis=1)
+        top = [run for run in _runs(rows >= 0.65) if run[0] < h * 0.22]
+        bottom = [run for run in _runs(rows >= 0.65) if run[1] > h * 0.78]
+        if not top or not bottom:
+            return None
+        first = max(top, key=lambda run: float(rows[run[0]:run[1]].sum()))
+        last = max(bottom, key=lambda run: float(rows[run[0]:run[1]].sum()))
+        a, b = round((first[0] + first[1] - 1) / 2), round((last[0] + last[1] - 1) / 2)
+        return (a, b) if b - a >= h * 0.5 else None
+
+    @staticmethod
+    def _field_edges(frame: np.ndarray, region: Box, top: int, bottom: int) -> tuple[float, float] | None:
+        """Find the field's long vertical strokes without assuming their hue.
+
+        Compare edges inside the minigame to the scene immediately above and
+        below it. This removes world geometry crossing a translucent field.
+        Use the band above the decorative mushroom to avoid species-dependent
+        shapes and outlines being mistaken for the rectangular goal.
+        """
+        x, _, width, _ = region
+        height = bottom - top
+        pad = max(8, round(height * 0.20))
+        rim = max(3, round(height * 0.05))
+        inset = max(2, round(height * 0.025))
+        image_h, image_w = frame.shape[:2]
+        sx, ex = max(0, x - 3), min(image_w, x + width + 3)
+        sy, ey = max(0, top - pad), min(image_h, bottom + pad)
+        sample = frame[sy:ey, sx:ex]
+        if sample.size == 0:
+            return None
+        gradient = cv2.convertScaleAbs(cv2.Sobel(sample, cv2.CV_32F, 1, 0, ksize=3), alpha=0.25)
+        b, g, r = cv2.split(gradient)
+        gradient = cv2.max(cv2.max(b, g), r)[:, x - sx:x - sx + width]
+        inner = gradient[top + inset - sy:bottom - inset - sy]
+        upper = gradient[top + inset - sy:top + max(inset + 1, round(height * 0.17)) - sy]
+        above = gradient[max(0, top - pad - sy):max(0, top - rim - sy)]
+        below = gradient[max(0, bottom + rim - sy):min(len(gradient), bottom + pad - sy)]
+        outside_parts = [part for part in (above, below) if part.size]
+        if inner.size == 0 or upper.size == 0 or not outside_parts:
+            return None
+        outside = np.concatenate(outside_parts, axis=0)
+        strength = np.maximum(0.0, inner.mean(axis=0) - outside.mean(axis=0) * 0.8)
+        full_support = (inner > 18).mean(axis=0)
+        upper_support = (upper > 18).mean(axis=0)
+        valid = (full_support > 0.18) & (strength > 8) & (upper_support > 0.45)
+        kernel = max(3, round(height * 0.017))
+        valid = cv2.morphologyEx(valid.astype(np.uint8)[None, :], cv2.MORPH_CLOSE, np.ones((1, kernel), dtype=np.uint8))[0] > 0
+        candidates = []
+        for a, b in _runs(valid):
+            if b - a > max(12, round(height * 0.13)):
+                continue
+            score = float(strength[a:b].sum()) / math.sqrt(b - a)
+            candidates.append(((a + b - 1) / 2.0, score))
+        pairs = [(a, b, score_a + score_b) for i, (a, score_a) in enumerate(candidates)
+                 for b, score_b in candidates[i + 1:] if width * 0.07 <= b - a <= width * 0.78]
+        if not pairs:
+            return None
+        left, right, _ = max(pairs, key=lambda pair: pair[2])
+        return x + left, x + right
+
+    @staticmethod
+    def _catch_cursor(crop: np.ndarray, bar_top: int, bar_bottom: int) -> tuple[float, float] | None:
+        height = bar_bottom - bar_top
+        start = max(0, bar_top + round(height * 0.12))
+        end = min(len(crop), bar_top + round(height * 0.44))
+        if end - start < 8:
+            return None
+        band = crop[start:end]
+        found = []
+        for box, area, cx, cy in _components(_white(band, 225), 8):
+            _, _, w, h = box
+            if 0.65 <= w / max(1, h) <= 1.55 and height * 0.055 <= w <= height * 0.28 and height * 0.055 <= h <= height * 0.28:
+                if area / (w * h) >= 0.5:
+                    found.append((area, cx, cy + start))
+        if found:
+            _, cx, cy = max(found)
+            return cx, cy
+        # A white boundary can join the white dot into a single component.
+        # Its circular rim still identifies the knob independently of the field.
+        gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
+        circles = cv2.HoughCircles(cv2.GaussianBlur(gray, (3, 3), 0), cv2.HOUGH_GRADIENT, 1.0,
+                                   max(8, height * 0.15), param1=80, param2=12,
+                                   minRadius=max(3, round(height * 0.045)), maxRadius=max(5, round(height * 0.13)))
+        if circles is None:
+            return None
+        yy, xx = np.indices(gray.shape)
+        candidates = []
+        for cx, cy, radius in circles[0]:
+            distance = np.hypot(xx - cx, yy - cy)
+            center = distance <= radius * 0.65
+            rim = (distance >= radius * 0.9) & (distance <= radius * 1.15)
+            if not np.any(center) or not np.any(rim):
+                continue
+            light = float(gray[center].mean())
+            contrast = light - float(gray[rim].mean())
+            if light >= 220 and contrast >= 16:
+                candidates.append((contrast, float(cx), float(cy + start)))
+        if not candidates:
+            return None
+        _, cx, cy = max(candidates)
+        return cx, cy
+
+    def _catching(self, frame: np.ndarray, now: float) -> TargetTrack | None:
+        crop, region = crop_region(frame, self.config.get("frequency_region"))
+        if crop.size == 0 or min(crop.shape[:2]) < 15:
+            return None
+        progress = self._progress(frame)
+        if progress is None or not self._catch_presence(frame, progress):
+            return None
+        limits = self._catch_bar_limits(crop)
+        if limits is None:
+            return None
+        bar_top, bar_bottom = limits
+        cursor = self._catch_cursor(crop, bar_top, bar_bottom)
+        if cursor is None:
+            return None
+        x, y, w, h = region
+        bounds = self._field_edges(frame, region, y + bar_top, y + bar_bottom)
+        if bounds is None:
+            return None
+        left, right = bounds
+        return TargetTrack((left + right) / 2.0, y + (bar_top + bar_bottom) / 2.0, 0.92, region,
+                           x + cursor[0], right - left, x + cursor[0], progress,
+                           left, right, y + bar_top, y + bar_bottom, y + cursor[1])
+
+    def analyze(self, frame: np.ndarray, now: float) -> Observation:
+        if not isinstance(frame, np.ndarray) or frame.ndim != 3 or frame.shape[2] < 3 or frame.size == 0:
+            return Observation()
+        frame = frame[:, :, :3]
+        if frame.dtype != np.uint8:
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+        self._refresh_templates()
+        self._features = {}
+        self._last_ring_present = False
+        self._last_ring_diagnostic = ""
+        normalized = self.config.get("charge_region")
+        shape = self.config.get("charge_shape", "ring")
+        if shape == "ring":
+            try:
+                rx, ry, rw, rh = (float(value) for value in normalized)
+                # Leave enough room for the complete circumference when a
+                # supplied screenshot is cropped more narrowly than its game.
+                normalized = (rx - rw * 0.12, ry - rh * 0.12, rw * 1.24, rh * 1.24)
+            except (TypeError, ValueError):
+                pass
+        charge_crop, charge_region = crop_region(frame, normalized)
+        charge = None
+        if charge_crop.size:
+            shape = self.config.get("charge_shape", "ring" if charge_region[2] / max(1, charge_region[3]) < 1.6 else "line")
+            charge = self._ring(charge_crop, charge_region, now) if shape == "ring" else self._linear_charge(charge_crop, charge_region)
+            if (shape == "ring" and charge is None and self._last_ring_present
+                    and self._ring_used_cached_geometry
+                    and not self._last_ring_diagnostic.startswith("Multiple white")
+                    and (now < self._last_geometry_retry or now - self._last_geometry_retry >= 0.12)):
+                # A slightly wrong cached center can pass the broad outline
+                # check yet clip a narrow pointer out of the marker annulus.
+                # Refit instead of permanently waiting on that stale geometry.
+                self._last_geometry_retry = now
+                if self._ring_outline(charge_crop, charge_region, force=True) is not None:
+                    charge = self._ring(charge_crop, charge_region, now)
+        if charge is not None:
+            # Ring timing is sensitive to frame rate. No inventory/text scans
+            # can change the charge action, so keep this fast path minimal.
+            return Observation(charge=charge, ring_present=self._last_ring_present)
+        if self._last_ring_present:
+            return Observation(ring_present=True, ring_diagnostic=self._last_ring_diagnostic)
+        tuning = None if charge is not None else self._tuning(frame, now)
+        if tuning is not None:
+            return Observation(tuning=tuning)
+        frequency = None if charge is not None or tuning is not None else self._catching(frame, now)
+        progress = None if charge is not None or tuning is not None else self._progress(frame)
+        catch_present = charge is None and tuning is None and self._catch_presence(frame, progress)
+        if catch_present:
+            return Observation(frequency=frequency, catch_present=True, catch_progress=progress)
+        # Catch notification samples are user-provided. Never infer a catch from
+        # the word Perfect while the starting minigame is still on screen.
+        success = charge is None and self._match(frame, "success", now) is not None
+        sell = self._match(frame, "sell", now)
+        confirm = self._match(frame, "confirm", now)
+        return Observation(charge, frequency, success, sell, confirm, tuning, catch_present, progress if catch_present else None)
+
+    @staticmethod
+    def annotate(frame: np.ndarray, observation: Observation) -> np.ndarray:
+        return annotate(frame, observation)
+
+
+def annotate(frame: np.ndarray, observation: Observation) -> np.ndarray:
+    """Draw a diagnostic copy; never alter the capture used for recognition."""
+    output = frame.copy()
+    if output.size == 0:
+        return output
+
+    def box(region: Box, label: str, color: tuple[int, int, int]) -> None:
+        x, y, w, h = region
+        cv2.rectangle(output, (x, y), (x + w - 1, y + h - 1), color, 1)
+        cv2.putText(output, label, (x, max(15, y - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+    def dot(x: float, y: float, color: tuple[int, int, int]) -> None:
+        cv2.circle(output, (round(x), round(y)), 5, color, 2)
+
+    if observation.charge is not None:
+        track = observation.charge
+        box(track.region, "Perfect", (40, 255, 70))
+        dot(*track.zone_center, (40, 255, 70))
+        dot(*track.marker_point, (255, 230, 30))
+        if track.center is not None and track.outline_radius > 0:
+            cv2.circle(output, (round(track.center[0]), round(track.center[1])), round(track.outline_radius), (160, 190, 255), 1)
+    elif observation.ring_present and observation.ring_diagnostic:
+        cv2.putText(output, f"Ring: {observation.ring_diagnostic}", (15, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 255), 1, cv2.LINE_AA)
+    if observation.tuning is not None:
+        track = observation.tuning
+        box(track.region, "Tuning", (255, 210, 30))
+        dot(track.target_x, track.y, (40, 255, 70))
+        dot(track.marker_x, track.y, (255, 230, 30))
+    if observation.frequency is not None:
+        track = observation.frequency
+        box(track.region, f"Catch {track.progress or 0:.0%}", (255, 180, 30))
+        dot(track.x, track.y, (40, 255, 70))
+        if all(value is not None for value in (track.goal_left, track.goal_right, track.goal_top, track.goal_bottom)):
+            cv2.rectangle(output, (round(track.goal_left), round(track.goal_top)), (round(track.goal_right), round(track.goal_bottom)), (40, 255, 70), 2)
+        if track.cursor_x is not None:
+            dot(track.cursor_x, track.cursor_y if track.cursor_y is not None else track.region[1] + track.region[3] * 0.25, (255, 230, 30))
+    for label, match in (("Sell", observation.sell), ("Confirm", observation.confirm)):
+        if match is not None:
+            box(match.box, f"{label} {match.score:.2f}", (0, 200, 255))
+    if observation.success:
+        cv2.putText(output, "Catch confirmed", (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (40, 255, 70), 2, cv2.LINE_AA)
+    return output

@@ -1,0 +1,33 @@
+{
+  "version": 2,
+  "profile_version": 2,
+  "source_resolution": [1919, 1079],
+  "template_source_resolutions": {
+    "sell": [1919, 1077],
+    "tune_prompt": [1919, 1079],
+    "catch_target": [1919, 1079]
+  },
+  "sell_every": 10,
+  "always_on_top": true,
+  "frequency_axis": "x",
+  "charge_action": "click",
+  "charge_shape": "ring",
+  "charge_region": [0.507, 0.418, 0.108, 0.190],
+  "tuning_region": [0.222, 0.746, 0.559, 0.147],
+  "frequency_region": [0.289, 0.735, 0.423, 0.154],
+  "progress_region": [0.335, 0.900, 0.331, 0.018],
+  "charge_marker_color": [245, 245, 245],
+  "frequency_target_color": [245, 245, 245],
+  "template_regions": {
+    "sell": [0.709, 0.544, 0.070, 0.069],
+    "tune_prompt": [0.403, 0.900, 0.195, 0.029],
+    "catch_target": [0.290, 0.781, 0.420, 0.096]
+  },
+  "input_latency": 0.008,
+  "control_mode": "hold_release",
+  "tuning_deadband": 0.004,
+  "catch_prediction": 0.085,
+  "catch_deadband": 0.012,
+  "initial_caught": 0,
+  "initial_sold_batches": 0
+}

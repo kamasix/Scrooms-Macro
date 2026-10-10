@@ -1,0 +1,60 @@
+name: Tagged Windows release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths: ['shrooms_macro/__init__.py']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+      - name: Check version and offline behavior
+        shell: pwsh
+        env:
+          RELEASE_REF: ${{ github.ref_name }}
+          RELEASE_REF_TYPE: ${{ github.ref_type }}
+        run: |
+          $taskVersion = .\.venv\Scripts\python.exe -c 'from shrooms_macro import __version__; print(__version__)'
+          if ($env:RELEASE_REF_TYPE -eq 'tag' -and $env:RELEASE_REF -cne "v$taskVersion") { throw 'Tag must match the application version.' }
+          "RELEASE_TAG=v$taskVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          .\.venv\Scripts\python.exe -m unittest discover -s tests -v
+          if ($LASTEXITCODE -ne 0) { throw 'Offline checks failed.' }
+      - name: Build executable
+        shell: pwsh
+        run: |
+          $taskName = 'ShroomsMacro-' + $env:RELEASE_TAG.TrimStart('v')
+          .\build.ps1 -OutputName $taskName
+          $taskExe = Join-Path dist ($taskName + '.exe')
+          $taskHash = (Get-FileHash -LiteralPath $taskExe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$taskHash  $taskName.exe" | Set-Content -LiteralPath dist\SHA256SUMS.txt -Encoding utf8NoBOM
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $taskExe = Join-Path dist ('ShroomsMacro-' + $env:RELEASE_TAG.TrimStart('v') + '.exe')
+          gh release view $env:RELEASE_TAG --json id *> $null
+          if ($LASTEXITCODE -eq 0) { Write-Output 'This version already has a release; existing files are preserved.'; exit 0 }
+          gh release create $env:RELEASE_TAG $taskExe dist/SHA256SUMS.txt --target $env:GITHUB_SHA --title "Shrooms Macro $env:RELEASE_TAG" --generate-notes
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed.' }

@@ -1,0 +1,23 @@
+# Local environments and build intermediates
+.venv/
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec
+*.exe
+*.zip
+
+# Private runtime data and optional diagnostics
+profiles/
+diagnostics/
+tests/fixtures/
+tests/diagnostics/
+*.log
+self-check.json
+*.tmp
+.env
+.env.*
+!.env.example
+Thumbs.db
+Desktop.ini
