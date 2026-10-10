@@ -1,13 +1,13 @@
 {
-  "version": 2,
-  "profile_version": 2,
+  "version": 3,
+  "profile_version": 3,
   "source_resolution": [1919, 1079],
   "template_source_resolutions": {
     "sell": [1919, 1077],
     "tune_prompt": [1919, 1079],
     "catch_target": [1919, 1079]
   },
-  "sell_every": 10,
+  "sell_every": 1,
   "always_on_top": true,
   "frequency_axis": "x",
   "charge_action": "click",

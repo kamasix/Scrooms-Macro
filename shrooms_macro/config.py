@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 
-PROFILE_VERSION = 2
+PROFILE_VERSION = 3
 
 
 def application_dir() -> Path:
@@ -46,17 +46,23 @@ class Profile:
         self.save()
 
     def _migrate(self, stored):
-        """Correct the old forced release mode without resetting calibrations."""
+        """Update old stock defaults without resetting authored settings."""
         try:
             previous_version = int(stored.get("profile_version", stored.get("version", 1)))
         except (AttributeError, ValueError, TypeError, OverflowError):
             previous_version = 1
-        if previous_version < PROFILE_VERSION and self.data.get("charge_action") == "release":
+        if previous_version < 2 and self.data.get("charge_action") == "release":
             self.data["charge_action"] = "click"
-        if previous_version < PROFILE_VERSION:
+        if previous_version < 2:
             try:
                 if math.isclose(float(self.data.get("input_latency", 0.008)), 0.028, rel_tol=0, abs_tol=1e-12):
                     self.data["input_latency"] = 0.008
+            except (TypeError, ValueError, OverflowError):
+                pass
+        if previous_version < 3:
+            try:
+                if float(self.data.get("sell_every", 1)) == 10:
+                    self.data["sell_every"] = 1
             except (TypeError, ValueError, OverflowError):
                 pass
         self.data["profile_version"] = max(PROFILE_VERSION, previous_version)
@@ -64,7 +70,7 @@ class Profile:
 
     def validate(self):
         for key, low, high, default in (
-            ("sell_every", 1, 999, 10), ("initial_caught", 0, 999, 0),
+            ("sell_every", 1, 999, 1), ("initial_caught", 0, 999, 0),
             ("initial_sold_batches", 0, 1000000, 0),
         ):
             try:

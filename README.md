@@ -4,7 +4,7 @@ A small Windows desktop macro for SCROOMS. It reads the visible Roblox window an
 
 ## Download and use
 
-Download `ShroomsMacro-1.0.5.exe` from [Releases](https://github.com/kamasix/Scrooms-Macro/releases). Place it in a writable folder and run it; Python is not required for the EXE.
+Download `ShroomsMacro-1.0.6.exe` from [Releases](https://github.com/kamasix/Scrooms-Macro/releases). Place it in a writable folder and run it; Python is not required for the EXE.
 
 1. Open SCROOMS in Roblox, stand where you want to catch, and equip your instrument.
 2. Select the Roblox window in the macro. Refresh the list if necessary.
@@ -18,13 +18,16 @@ Use **Join Discord** at the bottom of the window or [join the community here](ht
 ## What it does
 
 - Detects the rotating white pointer and narrow green **Perfect** segment. A click requires an observed overlap in a fresh frame.
-- Recovers the complete ring from its verified outline if a saved calibration clips the pointer, and keeps that analysis region while the ring stays visible.
+- Searches a limited neighborhood when a saved calibration clips too much of the ring to recognize its outline, then keeps the verified complete ring region while it stays visible.
 - Matches Frequency and follows the moving catch field: **hold left mouse to move right; release to move left**.
 - Keeps the physical cursor still during minigames. Selling is the only stage that moves it to a detected button.
-- After 10 detected catches by default, opens inventory with the backtick/tilde key and clicks **Sell All** twice, using a fresh button detection for each click.
+- After each detected catch by default, presses the backtick/tilde key, detects **Sell All**, clicks it twice using fresh button detections, then presses backtick/tilde again to close inventory. The catch interval is adjustable in Settings.
+- Holds inventory keys and sale clicks for up to 40 ms so the game can observe them. Stop interrupts these presses and releases the macro's inputs.
 - Pauses if Roblox loses focus, a control cannot be detected, or a stage times out. It preserves the catch count if it cannot find the sell button.
 
 The sale counter records completed input sequences; it does not read the game's currency balance.
+
+When upgrading from 1.0.5, the old default sale interval of 10 changes to 1. Custom intervals, calibration, and catch counts are preserved. Close the older version before starting the new EXE.
 
 ## Calibration
 

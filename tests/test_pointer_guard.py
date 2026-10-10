@@ -110,9 +110,265 @@ class PointerGuardTests(unittest.TestCase):
             self.desktop.tap(self.TARGET, cancel=self._cancel_signal())
         self.desktop._send_raw.assert_not_called()
 
+    def keyboard_events(self):
+        return [(call.args[0][0].ki.wVk, call.args[0][0].ki.dwFlags)
+                for call in self.desktop._send_raw.call_args_list]
+
+    def test_inventory_key_has_a_renderable_hold_before_release(self):
+        signal = self._cancel_signal()
+
+        def observe_press(duration):
+            self.assertEqual(duration, 0.040)
+            self.assertEqual(self.desktop._held_key, platform.VK_OEM_3)
+            self.assertEqual(self.keyboard_events(), [(platform.VK_OEM_3, 0)])
+            return False
+
+        signal.wait.side_effect = observe_press
+        self.desktop.key(self.TARGET, platform.VK_OEM_3, cancel=signal)
+        self.assertEqual(self.keyboard_events(), [(platform.VK_OEM_3, 0),
+                                                  (platform.VK_OEM_3, 0x0002)])
+        self.assertIsNone(self.desktop._held_key)
+
+    def test_cancelled_key_does_not_press_or_wait(self):
+        signal = self._cancel_signal()
+        signal.is_set.return_value = True
+        self.desktop.key(self.TARGET, platform.VK_OEM_3, cancel=signal)
+        self.desktop._send_raw.assert_not_called()
+        signal.wait.assert_not_called()
+        self.assertIsNone(self.desktop._held_key)
+
+    def test_cancellation_during_key_hold_releases_after_focus_loss(self):
+        signal = self._cancel_signal()
+
+        def cancel_during_press(duration):
+            self.assertEqual(duration, 0.040)
+            signal.is_set.return_value = True
+            self.desktop.is_foreground.return_value = False
+            return True
+
+        signal.wait.side_effect = cancel_during_press
+        self.desktop.key(self.TARGET, platform.VK_OEM_3, cancel=signal)
+        self.assertEqual(self.keyboard_events(), [(platform.VK_OEM_3, 0),
+                                                  (platform.VK_OEM_3, 0x0002)])
+        self.assertIsNone(self.desktop._held_key)
+
+    def test_rejected_key_down_has_no_unowned_release(self):
+        self.desktop._send_raw.return_value = 0
+        signal = self._cancel_signal()
+        with self.assertRaises(platform.InputUnavailable):
+            self.desktop.key(self.TARGET, platform.VK_OEM_3, cancel=signal)
+        self.assertEqual(self.keyboard_events(), [(platform.VK_OEM_3, 0)])
+        signal.wait.assert_not_called()
+        self.assertIsNone(self.desktop._held_key)
+
+    def test_failed_key_release_keeps_ownership_for_shutdown_retry(self):
+        self.desktop._send_raw.side_effect = [1, 0]
+        with self.assertRaises(platform.InputUnavailable):
+            self.desktop.key(self.TARGET, platform.VK_OEM_3,
+                             cancel=self._cancel_signal())
+        self.assertEqual(self.desktop._held_key, platform.VK_OEM_3)
+        self.desktop._send_raw.side_effect = None
+        self.desktop.close()
+        self.assertIsNone(self.desktop._held_key)
+        self.assertEqual(self.keyboard_events(), [(platform.VK_OEM_3, 0),
+                                                  (platform.VK_OEM_3, 0x0002),
+                                                  (platform.VK_OEM_3, 0x0002)])
+
+    def test_key_release_exception_can_be_retried_by_shutdown(self):
+        self.desktop._send_raw.side_effect = [1, OSError("mock release failure")]
+        with self.assertRaises(platform.InputUnavailable):
+            self.desktop.key(self.TARGET, platform.VK_OEM_3,
+                             cancel=self._cancel_signal())
+        self.assertEqual(self.desktop._held_key, platform.VK_OEM_3)
+        self.desktop._send_raw.side_effect = None
+        self.desktop.close()
+        self.assertIsNone(self.desktop._held_key)
+
+    def test_wait_exception_still_releases_accepted_key(self):
+        signal = self._cancel_signal()
+        signal.wait.side_effect = RuntimeError("mock cancelled wait")
+        with self.assertRaises(RuntimeError):
+            self.desktop.key(self.TARGET, platform.VK_OEM_3, cancel=signal)
+        self.assertEqual(self.keyboard_events(), [(platform.VK_OEM_3, 0),
+                                                  (platform.VK_OEM_3, 0x0002)])
+        self.assertIsNone(self.desktop._held_key)
+
+    def test_shutdown_can_release_key_while_hold_wait_is_running(self):
+        signal = self._cancel_signal()
+
+        def close_during_press(_duration):
+            # A different thread must acquire the input lock immediately;
+            # the hold wait must not postpone emergency cleanup.
+            closer = threading.Thread(target=self.desktop.close)
+            closer.start()
+            closer.join(timeout=1)
+            self.assertFalse(closer.is_alive())
+            self.assertIsNone(self.desktop._held_key)
+            return True
+
+        signal.wait.side_effect = close_during_press
+        self.desktop.key(self.TARGET, platform.VK_OEM_3, cancel=signal)
+        self.assertEqual(self.keyboard_events(), [(platform.VK_OEM_3, 0),
+                                                  (platform.VK_OEM_3, 0x0002)])
+
+    def test_key_foreground_guard_rejects_press_before_input(self):
+        self.desktop.is_foreground.return_value = False
+        with self.assertRaises(platform.InputUnavailable):
+            self.desktop.key(self.TARGET, platform.VK_OEM_3,
+                             cancel=self._cancel_signal())
+        self.desktop._send_raw.assert_not_called()
+
+    def test_previous_owned_key_is_released_before_a_new_press(self):
+        self.desktop._held_key = 0x41
+        self.desktop.key(self.TARGET, platform.VK_OEM_3,
+                         cancel=self._cancel_signal())
+        self.assertEqual(self.keyboard_events(), [(0x41, 0x0002),
+                                                  (platform.VK_OEM_3, 0),
+                                                  (platform.VK_OEM_3, 0x0002)])
+
+    def test_failed_previous_key_release_prevents_another_key_down(self):
+        self.desktop._held_key = 0x41
+        self.desktop._send_raw.return_value = 0
+        with self.assertRaises(platform.InputUnavailable):
+            self.desktop.key(self.TARGET, platform.VK_OEM_3,
+                             cancel=self._cancel_signal())
+        self.assertEqual(self.desktop._held_key, 0x41)
+        self.assertTrue(self.keyboard_events())
+        self.assertTrue(all(event == (0x41, 0x0002)
+                            for event in self.keyboard_events()))
+
+    def test_key_up_without_an_owned_press_sends_no_release(self):
+        self.assertTrue(self.desktop.key_up())
+        self.desktop._send_raw.assert_not_called()
+
+    def test_key_up_retries_owned_release_without_foreground_requirement(self):
+        self.desktop._held_key = platform.VK_OEM_3
+        self.desktop.is_foreground.return_value = False
+        self.desktop._send_raw.side_effect = [0, 1]
+        self.assertFalse(self.desktop.key_up())
+        self.assertEqual(self.desktop._held_key, platform.VK_OEM_3)
+        self.assertTrue(self.desktop.key_up())
+        self.assertIsNone(self.desktop._held_key)
+        self.assertEqual(self.keyboard_events(), [(platform.VK_OEM_3, 0x0002),
+                                                  (platform.VK_OEM_3, 0x0002)])
+
+    def mouse_events(self):
+        return [call.args[0][0].mi.dwFlags
+                for call in self.desktop._send_raw.call_args_list]
+
+    def test_sale_click_holds_for_a_renderable_frame_and_releases(self):
+        self.desktop.move = MagicMock()
+        signal = self._cancel_signal()
+
+        def observe_press(duration):
+            self.assertEqual(duration, 0.040)
+            self.assertTrue(self.desktop._left_held)
+            self.assertEqual(self.mouse_events(), [0x0002])
+            return False
+
+        signal.wait.side_effect = observe_press
+        self.desktop.click(self.TARGET, 230, 170, cancel=signal)
+        self.desktop.move.assert_called_once_with(self.TARGET, 230, 170)
+        self.assertEqual(self.mouse_events(), [0x0002, 0x0004])
+        self.assertFalse(self.desktop._left_held)
+
+    def test_cancelled_sale_click_does_not_move_or_press(self):
+        self.desktop.move = MagicMock()
+        signal = self._cancel_signal()
+        signal.is_set.return_value = True
+        self.desktop.click(self.TARGET, 230, 170, cancel=signal)
+        self.desktop.move.assert_not_called()
+        self.desktop._send_raw.assert_not_called()
+        signal.wait.assert_not_called()
+
+    def test_sale_click_cancelled_after_move_does_not_press(self):
+        signal = self._cancel_signal()
+        self.desktop.move = MagicMock(
+            side_effect=lambda *_args: setattr(signal.is_set, "return_value", True))
+        self.desktop.click(self.TARGET, 230, 170, cancel=signal)
+        self.desktop.move.assert_called_once()
+        self.desktop._send_raw.assert_not_called()
+        signal.wait.assert_not_called()
+
+    def test_sale_click_cancelled_during_hold_releases_after_focus_loss(self):
+        self.desktop.move = MagicMock()
+        signal = self._cancel_signal()
+
+        def cancel_during_press(duration):
+            self.assertEqual(duration, 0.040)
+            signal.is_set.return_value = True
+            self.desktop.is_foreground.return_value = False
+            return True
+
+        signal.wait.side_effect = cancel_during_press
+        self.desktop.click(self.TARGET, 230, 170, cancel=signal)
+        self.assertEqual(self.mouse_events(), [0x0002, 0x0004])
+        self.assertFalse(self.desktop._left_held)
+
+    def test_sale_click_on_other_window_refuses_press(self):
+        self.desktop.move = MagicMock()
+        self.api.GetAncestor.return_value = 303
+        with self.assertRaises(platform.InputUnavailable):
+            self.desktop.click(self.TARGET, 230, 170,
+                               cancel=self._cancel_signal())
+        self.desktop._send_raw.assert_not_called()
+
+    def test_sale_wait_exception_still_releases_owned_press(self):
+        self.desktop.move = MagicMock()
+        signal = self._cancel_signal()
+        signal.wait.side_effect = RuntimeError("mock cancelled wait")
+        with self.assertRaises(RuntimeError):
+            self.desktop.click(self.TARGET, 230, 170, cancel=signal)
+        self.assertEqual(self.mouse_events(), [0x0002, 0x0004])
+        self.assertFalse(self.desktop._left_held)
+
+    def test_sale_click_failed_release_can_be_retried_by_shutdown(self):
+        self.desktop.move = MagicMock()
+        self.desktop._send_raw.side_effect = [1, 0]
+        with self.assertRaises(platform.InputUnavailable):
+            self.desktop.click(self.TARGET, 230, 170,
+                               cancel=self._cancel_signal())
+        self.assertTrue(self.desktop._left_held)
+        self.desktop._send_raw.side_effect = None
+        self.desktop.close()
+        self.assertFalse(self.desktop._left_held)
+        self.assertEqual(self.mouse_events(), [0x0002, 0x0004, 0x0004])
+
+    def test_shutdown_can_release_sale_press_during_hold_wait(self):
+        self.desktop.move = MagicMock()
+        signal = self._cancel_signal()
+
+        def close_during_press(_duration):
+            closer = threading.Thread(target=self.desktop.close)
+            closer.start()
+            closer.join(timeout=1)
+            self.assertFalse(closer.is_alive())
+            self.assertFalse(self.desktop._left_held)
+            return True
+
+        signal.wait.side_effect = close_during_press
+        self.desktop.click(self.TARGET, 230, 170, cancel=signal)
+        self.assertEqual(self.mouse_events(), [0x0002, 0x0004])
+
 
 @unittest.skipUnless(sys.platform == "win32", "Windows backend")
 class TapControllerTests(unittest.TestCase):
+    def test_inventory_and_sale_click_use_the_stop_signal(self):
+        from shrooms_macro.app import Application
+        from shrooms_macro.engine import Action
+
+        app = Application.__new__(Application)
+        app.target = 101
+        app.desktop = MagicMock()
+        app.input_cancel = threading.Event()
+        app.engine = SimpleNamespace(phase="sell_first")
+        app._action(Action("inventory"))
+        app._action(Action("click", 0.75, 0.6))
+        app.desktop.key.assert_called_once_with(101, platform.VK_OEM_3,
+                                               cancel=app.input_cancel)
+        app.desktop.click.assert_called_once_with(101, 0.75, 0.6,
+                                                 cancel=app.input_cancel)
+
     def test_stale_overlap_is_rejected_before_dispatch(self):
         from shrooms_macro.app import Application
         from shrooms_macro.engine import Action
@@ -176,7 +432,85 @@ class TapControllerTests(unittest.TestCase):
         self.assertIsNone(app.pending_start)
         app.root.after_cancel.assert_called_once_with("start-timer")
         app.desktop.mouse_up.assert_called_once()
+        app.desktop.key_up.assert_called_once()
         app.engine.pause.assert_called_once_with("Paused")
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows backend")
+class InputCleanupControllerTests(unittest.TestCase):
+    def setUp(self):
+        from shrooms_macro.app import Application
+
+        self.app = Application.__new__(Application)
+        self.app.root = MagicMock()
+        self.app.ui = MagicMock()
+        self.app.desktop = MagicMock()
+        self.app.desktop.key_up.return_value = True
+        self.app.desktop.cursor_over.return_value = True
+        self.app.target = 101
+        self.app.target_label = "Mock game"
+        self.app.pending_start = None
+        self.app.generation = 4
+        self.app.calibrating = False
+        self.app.shutdown = threading.Event()
+        self.app.active = threading.Event()
+        self.app.input_cancel = threading.Event()
+        self.app.input_cancel.set()
+        self.app.control_lock = threading.RLock()
+        self.app.input_release_warning = ""
+        self.app.engine = SimpleNamespace(status="Paused", caught=0, sold_batches=0,
+                                          error="", pause=MagicMock(), start=MagicMock())
+        self.app.engine.pause.side_effect = lambda reason: setattr(self.app.engine, "status", reason)
+        logger_patch = patch("shrooms_macro.app.logging.warning")
+        self.warning_log = logger_patch.start()
+        self.addCleanup(logger_patch.stop)
+
+    def test_failed_key_release_blocks_resume_before_focus_or_actions(self):
+        self.app.desktop.key_up.return_value = False
+        self.app.finish_start()
+        self.assertFalse(self.app.active.is_set())
+        self.assertTrue(self.app.input_cancel.is_set())
+        self.app.desktop.focus.assert_not_called()
+        self.app.engine.start.assert_not_called()
+        self.app.engine.pause.assert_called_once()
+        warning = self.app.ui.update_status.call_args.args[0]["warning"]
+        self.assertIn("did not release the held key", warning)
+        self.assertIn("Press Stop", warning)
+        self.warning_log.assert_called_once()
+
+    def test_successful_release_retry_allows_resume_and_clears_warning(self):
+        self.app.desktop.key_up.side_effect = [False, True]
+        self.app.finish_start()
+        self.assertFalse(self.app.active.is_set())
+        self.app.finish_start()
+        self.assertTrue(self.app.active.is_set())
+        self.assertFalse(self.app.input_cancel.is_set())
+        self.app.desktop.focus.assert_called_once_with(self.app.target)
+        self.app.engine.start.assert_called_once()
+        self.assertEqual(self.app.snapshot()["warning"], "")
+
+    def test_stop_surfaces_release_failure_and_preserves_warning_in_later_snapshots(self):
+        self.app.active.set()
+        self.app.desktop.key_up.return_value = False
+        self.app.stop("Stopped")
+        self.assertFalse(self.app.active.is_set())
+        self.assertTrue(self.app.input_cancel.is_set())
+        snapshot = self.app.ui.update_status.call_args.args[0]
+        self.assertEqual(snapshot["status"], "Stopped")
+        self.assertIn("did not release the held key", snapshot["warning"])
+        self.assertEqual(self.app.snapshot()["warning"], snapshot["warning"])
+        self.warning_log.assert_called_once()
+
+    def test_normal_stop_keeps_status_and_does_not_show_a_release_warning(self):
+        self.app.active.set()
+        self.app.stop("Paused — F6 resumes")
+        snapshot = self.app.ui.update_status.call_args.args[0]
+        self.assertFalse(snapshot["running"])
+        self.assertEqual(snapshot["status"], "Paused — F6 resumes")
+        self.assertEqual(snapshot["warning"], "")
+        self.app.desktop.mouse_up.assert_called_once()
+        self.app.desktop.key_up.assert_called_once()
+        self.warning_log.assert_not_called()
 
 
 if __name__ == "__main__":

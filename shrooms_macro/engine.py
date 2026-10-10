@@ -154,7 +154,7 @@ class Engine:
                 return []
             self._enter("idle", now)
 
-        if self.caught >= int(self.config.get("sell_every", 10)):
+        if self.caught >= int(self.config.get("sell_every", 1)):
             self._enter("sell_open", now, 0.3)
             self.status = "Opening inventory to sell"
             return [Action("up")]
@@ -358,8 +358,8 @@ class Engine:
             return [Action("up")]
         if self.phase == "sell_open":
             self._enter("sell_first", now, 0.6)
-            if obs.sell is not None:
-                return []
+            # A preopening template match cannot replace the explicit key
+            # press. Read the Sell All button again after inventory opens.
             return [Action("inventory")]
         if self.phase == "sell_first" and obs.sell is not None:
             self._enter("sell_confirm", now, 0.65)
@@ -374,12 +374,12 @@ class Engine:
                 self.status = "Confirming the sale"
                 return [Action("click", match.x, match.y)]
         if self.phase == "sell_finish":
-            if self.config.get("separate_confirmation", False) and obs.confirm is not None:
-                return []
             # Counts describe completed input sequences; the game balance is never read.
             self.caught = 0
             self.sold_batches += 1
             self._enter("cooldown", now, 1.0)
             self.status = "Confirmation sent — returning to catches"
-            return [Action("inventory")] if obs.sell is not None else []
+            # The requested cycle always ends with a second backtick press,
+            # even when the button disappears immediately after confirmation.
+            return [Action("inventory")]
         return []

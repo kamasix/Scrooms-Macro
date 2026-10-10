@@ -32,7 +32,8 @@ class ProfileChecks(unittest.TestCase):
     def test_new_profile_uses_stationary_click_and_current_schema(self):
         profile = self.profile()
         self.assertEqual(profile.data["charge_action"], "click")
-        self.assertEqual(profile.data["profile_version"], 2)
+        self.assertEqual(profile.data["profile_version"], 3)
+        self.assertEqual(profile.data["sell_every"], 1)
         self.assertEqual(profile.data["input_latency"], 0.008)
         self.assertEqual(profile.data["control_mode"], "hold_release")
 
@@ -52,7 +53,7 @@ class ProfileChecks(unittest.TestCase):
         self.assertEqual(profile.data["initial_caught"], 6)
         self.assertEqual(profile.data["initial_sold_batches"], 9)
         saved = json.loads(profile.path.read_text(encoding="utf-8"))
-        self.assertEqual(saved["profile_version"], 2)
+        self.assertEqual(saved["profile_version"], 3)
         self.assertEqual(saved["charge_action"], "click")
 
     def test_v1_custom_input_latency_is_preserved(self):
@@ -66,6 +67,46 @@ class ProfileChecks(unittest.TestCase):
         profile.save()
         reloaded = Profile(self.base)
         self.assertEqual(reloaded.data["charge_action"], "release")
+
+    def test_v2_stock_sale_interval_migrates_without_changing_controls_or_counts(self):
+        region = [0.1, 0.2, 0.3, 0.4]
+        templates = {"sell": [0.5, 0.6, 0.1, 0.1]}
+        profile = self.profile({
+            "profile_version": 2, "charge_action": "release", "input_latency": 0.028,
+            "charge_region": region, "template_regions": templates,
+            "sell_every": 10, "initial_caught": 8, "initial_sold_batches": 9,
+        })
+        self.assertEqual(profile.data["profile_version"], 3)
+        self.assertEqual(profile.data["sell_every"], 1)
+        self.assertEqual(profile.data["charge_action"], "release")
+        self.assertEqual(profile.data["input_latency"], 0.028)
+        self.assertEqual(profile.data["charge_region"], region)
+        self.assertEqual(profile.data["template_regions"], templates)
+        self.assertEqual(profile.data["initial_caught"], 8)
+        self.assertEqual(profile.data["initial_sold_batches"], 9)
+        reloaded = Profile(self.base)
+        self.assertEqual(reloaded.data, profile.data)
+
+    def test_v1_stock_sale_interval_and_old_forced_controls_migrate_together(self):
+        profile = self.profile({
+            "version": 1, "sell_every": "10", "charge_action": "release",
+            "input_latency": 0.028, "initial_caught": 6,
+        })
+        self.assertEqual(profile.data["sell_every"], 1)
+        self.assertEqual(profile.data["charge_action"], "click")
+        self.assertEqual(profile.data["input_latency"], 0.008)
+        self.assertEqual(profile.data["initial_caught"], 6)
+
+    def test_v2_custom_sale_interval_is_preserved(self):
+        profile = self.profile({"profile_version": 2, "sell_every": 14})
+        self.assertEqual(profile.data["profile_version"], 3)
+        self.assertEqual(profile.data["sell_every"], 14)
+
+    def test_v3_chosen_ten_catch_sale_interval_is_preserved(self):
+        profile = self.profile({"profile_version": 3, "sell_every": 10})
+        self.assertEqual(profile.data["sell_every"], 10)
+        profile.save()
+        self.assertEqual(Profile(self.base).data["sell_every"], 10)
 
     def test_bad_latency_and_unknown_action_fall_back_without_breaking_profile(self):
         profile = self.profile({"profile_version": 2, "charge_action": "invalid", "input_latency": "nan"})

@@ -211,6 +211,7 @@ class Detector:
         self._ring_used_cached_geometry = False
         self._last_geometry_retry = -math.inf
         self._ring_recovered_region: tuple[tuple[int, int], Box, Box] | None = None
+        self._last_local_ring_search: tuple[tuple[int, int], Box, float] | None = None
         self._scan_cache: dict[str, tuple[float, Match | None]] = {}
         self._features: dict[tuple[Any, ...], np.ndarray] = {}
         self._refresh_templates(force=True)
@@ -305,6 +306,7 @@ class Detector:
         threshold = _number(self.config.get(f"{name}_threshold"), 0.82 if name == "success" else 0.76)
         threshold = max(0.55, min(0.995, threshold))
         best: Match | None = None
+        integral = squared_integral = None
         for scale in self._scales(name, frame):
             th, tw = template.feature.shape[:2]
             tw, th = max(3, round(tw * scale / sx)), max(3, round(th * scale / sy))
@@ -321,6 +323,21 @@ class Detector:
                 self._scaled[key] = needle
             result = cv2.matchTemplate(haystack, needle, cv2.TM_CCOEFF_NORMED)
             np.nan_to_num(result, copy=False, nan=-1.0, posinf=-1.0, neginf=-1.0)
+            # Normalized correlation is undefined on constant image windows.
+            # Some OpenCV builds report 1.0 there, hiding the real text match
+            # behind a black/white patch. Exclude only those flat windows;
+            # retain the existing correlation and foreground checks below.
+            if integral is None:
+                integral, squared_integral = cv2.integral2(haystack, sdepth=cv2.CV_64F, sqdepth=cv2.CV_64F)
+            # Integral arrays are one pixel larger on both axes. These four
+            # corners yield exactly (height-th+1, width-tw+1), aligned with
+            # each correlation candidate's top-left coordinate.
+            sums = integral[th:, tw:] - integral[:-th, tw:] - integral[th:, :-tw] + integral[:-th, :-tw]
+            squares = (squared_integral[th:, tw:] - squared_integral[:-th, tw:]
+                       - squared_integral[th:, :-tw] + squared_integral[:-th, :-tw])
+            area = tw * th
+            variance = squares / area - (sums / area) ** 2
+            result[variance <= 1e-6] = -1.0
             _, score, _, location = cv2.minMaxLoc(result)
             if score < threshold or (best is not None and score <= best.score):
                 continue
@@ -358,8 +375,10 @@ class Detector:
         interval = 0.55 if local_box is not None else 0.18
         if cached is not None and 0 <= now - cached[0] < interval:
             # A failed calibrated-area check invalidates a previously found
-            # button immediately, so input never follows stale coordinates.
-            return None if local_box is not None else cached[1]
+            # button immediately. Global sale/confirmation matches must also
+            # come from this frame: throttle scans by waiting, not replaying
+            # an earlier actionable coordinate after a dialog changes.
+            return None if local_box is not None or name in ("sell", "confirm") else cached[1]
         h, w = frame.shape[:2]
         reduction = min(1.0, 1100.0 / max(w, h))
         match = self._match_in(frame, name, (0, 0, w, h), reduction)
@@ -390,7 +409,8 @@ class Detector:
             return 0.0
         return float(ring[valid].mean())
 
-    def _ring_outline(self, crop: np.ndarray, region: Box, *, force: bool = False) -> float | None:
+    def _ring_outline(self, crop: np.ndarray, region: Box, *, force: bool = False,
+                      radius_reference: float | None = None) -> float | None:
         _, _, w, h = region
         previous = self._ring_geometry
         self._ring_used_cached_geometry = False
@@ -401,14 +421,15 @@ class Detector:
                 self._ring_used_cached_geometry = True
                 return score
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        reference = min(w, h) if radius_reference is None else radius_reference
         circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, 1.0, min(w, h) * 0.20,
-                                   param1=80, param2=25, minRadius=round(min(w, h) * 0.25), maxRadius=round(min(w, h) * 0.57))
+                                   param1=80, param2=25, minRadius=round(reference * 0.25), maxRadius=round(reference * 0.57))
         best = None
         if circles is not None:
             for proposed in circles[0]:
                 cx, cy, proposed_radius = (float(v) for v in proposed)
                 for radius in (proposed_radius, proposed_radius / 0.75, proposed_radius * 0.75):
-                    if not min(w, h) * 0.25 <= radius <= min(w, h) * 0.59:
+                    if not reference * 0.25 <= radius <= reference * 0.59:
                         continue
                     score = self._outline_score(crop, cx, cy, radius)
                     if score >= 0.55 and (best is None or score > best[0]):
@@ -433,7 +454,8 @@ class Detector:
         self._ring_geometry = (region, cx, cy, radius)
         return score
 
-    def _recover_ring_crop(self, frame: np.ndarray, base_region: Box, region: Box) -> tuple[np.ndarray, Box] | None:
+    def _recover_ring_crop(self, frame: np.ndarray, base_region: Box, region: Box,
+                           *, force: bool = False) -> tuple[np.ndarray, Box] | None:
         """Complete a clipped, independently verified circle within its local area.
 
         A manual rectangle can start inside the ring. Enough of the outline may
@@ -445,7 +467,7 @@ class Detector:
         x, y, width, height = region
         _, cx, cy, radius = self._ring_geometry
         outer = radius * 1.14 + 2.0
-        if (cx - outer >= 0 and cy - outer >= 0
+        if (not force and cx - outer >= 0 and cy - outer >= 0
                 and cx + outer < width and cy + outer < height):
             return None
         frame_height, frame_width = frame.shape[:2]
@@ -469,6 +491,38 @@ class Detector:
         crop = frame[top:bottom, left:right]
         self._ring_outline(crop, recovered, force=True)
         return crop, recovered
+
+    def _find_local_ring_crop(self, frame: np.ndarray, base_region: Box,
+                              now: float) -> tuple[np.ndarray, Box] | None:
+        """Find a nearby circle when a manual crop hides too much to fit it.
+
+        Search stays around that local rectangle. Its original size supplies
+        the radius range: enlarging the search must not exclude the real ring
+        by making Hough's minimum radius larger than the game control.
+        """
+        dimensions = frame.shape[:2]
+        previous = self._last_local_ring_search
+        if (previous is not None and previous[:2] == (dimensions, base_region)
+                and 0 <= now - previous[2] < 0.25):
+            return None
+        self._last_local_ring_search = (dimensions, base_region, now)
+        x, y, width, height = base_region
+        if min(width, height) < 35:
+            return None
+        padding_x, padding_y = math.ceil(width * 0.65), math.ceil(height * 0.65)
+        left, top = max(0, x - padding_x), max(0, y - padding_y)
+        right = min(dimensions[1], x + width + padding_x)
+        bottom = min(dimensions[0], y + height + padding_y)
+        search_region = (left, top, right - left, bottom - top)
+        if search_region == base_region:
+            return None
+        crop = frame[top:bottom, left:right]
+        if self._ring_outline(crop, search_region, force=True,
+                              radius_reference=min(width, height)) is None:
+            return None
+        # Immediately return to a compact, cached ROI around the verified
+        # circle. Normal frames do not repeat the wider fallback or Hough fit.
+        return self._recover_ring_crop(frame, base_region, search_region, force=True)
 
     def _ring(self, crop: np.ndarray, region: Box, now: float | None = None) -> BarTrack | None:
         now = time.monotonic() if now is None else now
@@ -838,6 +892,11 @@ class Detector:
                 self._ring_recovered_region = None
                 charge_crop, charge_region = base_charge_crop, base_charge_region
                 charge = self._ring(charge_crop, charge_region, now)
+            if shape == "ring" and not self._last_ring_present:
+                nearby = self._find_local_ring_crop(frame, base_charge_region, now)
+                if nearby is not None:
+                    charge_crop, charge_region = nearby
+                    charge = self._ring(charge_crop, charge_region, now)
             if shape == "ring" and self._last_ring_present:
                 complete = self._recover_ring_crop(frame, base_charge_region, charge_region)
                 if complete is not None:

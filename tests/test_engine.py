@@ -211,8 +211,56 @@ class EngineChecks(unittest.TestCase):
         self.assertEqual([a.kind for a in second], ["click"])
         self.assertEqual(self.engine.caught, 10)
         final = self.step(Observation(), 4.1)
-        self.assertEqual(final, [])  # already closed; never reopen it
+        self.assertEqual([a.kind for a in final], ["inventory"])
         self.assertEqual(self.engine.caught, 0)
+        self.assertEqual(self.engine.sold_batches, 1)
+
+    def test_sell_always_opens_inventory_despite_a_preopening_button_match(self):
+        self.engine.caught = 10
+        button = Match(1420, 635, .99, (1380, 620, 80, 30))
+        self.assertEqual([a.kind for a in self.step(Observation(sell=button), 1)], ["up"])
+        opening = self.step(Observation(sell=button), 1.4)
+        self.assertEqual([a.kind for a in opening], ["inventory"])
+        self.assertEqual(self.engine.phase, "sell_first")
+        # Neither a repeated preopening match nor a short detector gap may
+        # reopen inventory or issue the first sale before its opening delay.
+        self.assertEqual(self.step(Observation(sell=button), 1.5), [])
+        self.assertEqual(self.step(Observation(), 2.1), [])
+        self.assertEqual([a.kind for a in self.step(Observation(sell=button), 2.2)], ["click"])
+        self.assertEqual(self.step(Observation(), 3), [])
+        self.assertEqual([a.kind for a in self.step(Observation(sell=button), 3.2)], ["click"])
+        self.assertEqual([a.kind for a in self.step(Observation(), 4.1)], ["inventory"])
+        self.assertEqual(self.engine.sold_batches, 1)
+
+    def test_single_confirmed_catch_runs_open_two_fresh_clicks_and_close(self):
+        self.config["sell_every"] = 1
+        button = Match(1420, 635, .99, (1380, 620, 80, 30))
+        self.catch(.4, 1)
+        self.assertEqual([a.kind for a in self.step(Observation(success=True), 2)], ["up"])
+        self.assertEqual(self.engine.caught, 1)
+        self.assertEqual([a.kind for a in self.step(Observation(), 3.3)], ["up"])
+        opening = self.step(Observation(sell=button), 3.7)
+        self.assertEqual([a.kind for a in opening], ["inventory"])
+        self.assertEqual(self.step(Observation(), 4.4), [])
+        first = self.step(Observation(sell=button), 4.5)
+        self.assertEqual([a.kind for a in first], ["click"])
+        self.assertEqual(self.step(Observation(), 5.2), [])
+        second = self.step(Observation(sell=button), 5.3)
+        self.assertEqual([a.kind for a in second], ["click"])
+        self.assertEqual([a.kind for a in self.step(Observation(), 6.2)], ["inventory"])
+        self.assertEqual(self.engine.caught, 0)
+        self.assertEqual(self.engine.sold_batches, 1)
+
+    def test_sell_closes_inventory_once_even_if_confirmation_is_still_visible(self):
+        self.config["separate_confirmation"] = True
+        self.engine.caught = 10
+        button = Match(1420, 635, .99, (1380, 620, 80, 30))
+        self.step(Observation(), 1)
+        self.step(Observation(), 1.4)
+        self.step(Observation(sell=button), 2.1)
+        self.assertEqual([a.kind for a in self.step(Observation(confirm=button), 3)], ["click"])
+        self.assertEqual([a.kind for a in self.step(Observation(confirm=button), 3.9)], ["inventory"])
+        self.assertEqual(self.step(Observation(), 4), [])
         self.assertEqual(self.engine.sold_batches, 1)
 
     def test_separate_confirmation_does_not_click_unconfirmed_sell_again(self):

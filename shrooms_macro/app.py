@@ -49,6 +49,7 @@ class Application:
         self.active = threading.Event()
         self.shutdown = threading.Event()
         self.input_cancel = threading.Event()
+        self.input_release_warning = ""
         self.control_lock = threading.RLock()
         self.detector_lock = threading.RLock()
         self.generation = 0
@@ -88,7 +89,17 @@ class Application:
     def snapshot(self, warning=""):
         return {"running": self.active.is_set(), "status": self.engine.status,
                 "caught": self.engine.caught, "sold_batches": self.engine.sold_batches,
-                "target": self.target_label, "warning": warning or self.engine.error}
+                "target": self.target_label,
+                "warning": warning or getattr(self, "input_release_warning", "") or self.engine.error}
+
+    def _release_inputs(self):
+        self.desktop.mouse_up()
+        self.input_release_warning = (
+            "Windows did not release the held key. Press Stop to retry."
+            if self.desktop.key_up() is False else "")
+        if self.input_release_warning:
+            logging.warning(self.input_release_warning)
+        return self.input_release_warning
 
     def post(self, snapshot):
         snapshot["generation"] = self.generation
@@ -132,6 +143,9 @@ class Application:
         if self.shutdown.is_set() or self.calibrating:
             return
         try:
+            warning = self._release_inputs()
+            if warning:
+                raise InputUnavailable(warning)
             self.desktop.focus(self.target)
             if not self.desktop.cursor_over(self.target):
                 raise InputUnavailable("Place the cursor over a clear area of Roblox and press F6.")
@@ -141,7 +155,11 @@ class Application:
                 self.input_cancel.clear()
                 self.active.set()
         except InputUnavailable as error:
-            self.engine.pause("Start cancelled — cursor must be over the game")
+            with self.control_lock:
+                self.active.clear()
+                self.input_cancel.set()
+                self.generation += 1
+                self.engine.pause("Start cancelled — input could not be prepared")
             self.ui.update_status(self.snapshot(str(error)))
 
     def stop(self, reason="Stopped — F6 starts"):
@@ -153,7 +171,7 @@ class Application:
         with self.control_lock:
             self.active.clear()
             self.generation += 1
-            self.desktop.mouse_up()
+            self._release_inputs()
             self.engine.pause(reason)
         if hasattr(self, "ui"):
             self.ui.update_status(self.snapshot())
@@ -195,9 +213,9 @@ class Application:
         elif action.kind == "click":
             if not self.engine.phase.startswith("sell"):
                 raise RuntimeError("Clicks that move the cursor are allowed only during a sale.")
-            self.desktop.click(self.target, action.x, action.y)
+            self.desktop.click(self.target, action.x, action.y, cancel=self.input_cancel)
         elif action.kind == "inventory":
-            self.desktop.key(self.target, VK_OEM_3)
+            self.desktop.key(self.target, VK_OEM_3, cancel=self.input_cancel)
 
     def work(self):
         try:
@@ -242,14 +260,14 @@ class Application:
                             self._action(action, captured_at=captured_at)
                         if self.engine.error:
                             self.active.clear()
-                            self.desktop.mouse_up()
+                            self._release_inputs()
                         self.post(self.snapshot())
                 except InputUnavailable as error:
                     with self.control_lock:
                         if generation != self.generation:
                             continue
                         self.active.clear()
-                        self.desktop.mouse_up()
+                        self._release_inputs()
                         self.engine.pause(str(error))
                         self.post(self.snapshot())
                 except Exception as error:
@@ -258,14 +276,15 @@ class Application:
                         if generation != self.generation:
                             continue
                         self.active.clear()
-                        self.desktop.mouse_up()
+                        release_warning = self._release_inputs()
                         self.engine.pause("Stopped after an error")
-                        self.post(self.snapshot(str(error)))
+                        warning = str(error) + (" · " + release_warning if release_warning else "")
+                        self.post(self.snapshot(warning))
                 # Bounded, interruptible timing; no busy waiting or long input sequences.
                 interval = 1 / 120 if self.engine.phase in ("charge", "transition") else 1 / 60
                 self.shutdown.wait(max(0, interval - (time.perf_counter() - began)))
         finally:
-            self.desktop.mouse_up()
+            self._release_inputs()
 
     def poll(self):
         if self.shutdown.is_set():

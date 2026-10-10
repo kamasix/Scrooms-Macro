@@ -216,7 +216,7 @@ class Desktop:
     """Capture Roblox Player and send foreground-only desktop mouse/key events.
 
     A Desktop instance should be used by one automation worker at a time. Calling
-    ``mouse_up`` or ``close`` is always safe, including from shutdown cleanup.
+    ``mouse_up``, ``key_up`` or ``close`` is always safe, including from cleanup.
     """
 
     def __init__(self) -> None:
@@ -225,6 +225,7 @@ class Desktop:
         self._closed = False
         self._left_held = False
         self._held_hwnd: int | None = None
+        self._held_key: int | None = None
         self._input_lock = threading.RLock()
 
     @staticmethod
@@ -468,13 +469,28 @@ class Desktop:
             except Exception:
                 pass  # Retain ownership so later cleanup can retry the release.
 
-    def click(self, hwnd: int, x: float, y: float) -> None:
-        self.mouse_up()
+    def click(self, hwnd: int, x: float, y: float,
+              cancel: threading.Event | None = None) -> None:
+        """Click a sale button with a cancellable, renderable 40 ms press."""
         try:
-            self.move(hwnd, x, y)
-            self.mouse_down(hwnd)
+            with self._input_lock:
+                self.mouse_up()
+                if self._left_held:
+                    raise InputUnavailable("Windows did not release the previous mouse press.")
+                if cancel is not None and cancel.is_set():
+                    return
+                self.move(hwnd, x, y)
+                if cancel is not None and cancel.is_set():
+                    return
+                self.mouse_down(hwnd)
+            if cancel is not None:
+                cancel.wait(0.040)
+            else:
+                threading.Event().wait(0.040)
         finally:
             self.mouse_up()
+        if self._left_held:
+            raise InputUnavailable("Windows did not release the mouse press.")
 
     def tap(self, hwnd: int, cancel: threading.Event | None = None) -> None:
         """Click at the current cursor position without moving it.
@@ -498,23 +514,50 @@ class Desktop:
         finally:
             self.mouse_up()
 
-    def key(self, hwnd: int, vk: int) -> None:
+    def key_up(self) -> bool:
+        """Release our key after focus loss; False retains ownership for retry."""
         with self._input_lock:
+            if self._held_key is None:
+                return True
             try:
+                if self._send_raw([_keyboard_input(self._held_key, True)]) == 1:
+                    self._held_key = None
+                    return True
+            except Exception:
+                pass  # Preserve ownership so shutdown or the next attempt can retry.
+            return False
+
+    def key(self, hwnd: int, vk: int, cancel: threading.Event | None = None) -> None:
+        """Press a foreground-only key for up to 40 ms, then always release it.
+
+        Separate down/up events give the game a rendered frame to observe the
+        press. The wait holds no input lock and cancellation releases it early.
+        """
+        try:
+            with self._input_lock:
                 vk = int(vk)
                 if not 1 <= vk <= 0xFF:
                     raise ValueError("Invalid Windows virtual-key code.")
                 self.mouse_up()
+                if self._left_held:
+                    raise InputUnavailable("Windows did not release the previous mouse press.")
+                if not self.key_up():
+                    raise InputUnavailable("Windows did not release the previous key press.")
+                if cancel is not None and cancel.is_set():
+                    return
                 self._guard(hwnd)
-                accepted = self._send_raw([_keyboard_input(vk), _keyboard_input(vk, True)])
-                if accepted != 2:
-                    if accepted == 1:
-                        # Release only when Windows accepted our preceding press.
-                        self._send_raw([_keyboard_input(vk, True)])
+                if self._send_raw([_keyboard_input(vk)]) != 1:
                     raise InputUnavailable("Windows did not accept the keyboard event.")
-            except Exception:
-                self.mouse_up()
-                raise
+                self._held_key = vk
+            if cancel is not None:
+                cancel.wait(0.040)
+            else:
+                threading.Event().wait(0.040)
+        finally:
+            self.mouse_up()
+            released = self.key_up()
+        if not released:
+            raise InputUnavailable("Windows did not release the key press.")
 
     def key_pressed(self, vk: int) -> bool:
         return bool(_user32.GetAsyncKeyState(vk) & 0x8000)
@@ -523,6 +566,7 @@ class Desktop:
         with self._input_lock:
             self._closed = True
             self.mouse_up()
+            self.key_up()
 
     def __enter__(self) -> "Desktop":
         return self

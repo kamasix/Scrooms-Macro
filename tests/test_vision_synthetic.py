@@ -1,9 +1,11 @@
-"""Generated ring pixels: no game screenshot, desktop capture, or mouse input."""
+"""Generated controls: no game screenshot, desktop capture, or mouse input."""
 
 import json
 import math
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -15,11 +17,14 @@ from shrooms_macro.vision import Detector
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def ring_frame(pointer_angle, goal_angle=0.0, height=1080, pointer=True, target=True):
+def ring_frame(pointer_angle, goal_angle=0.0, height=1080, pointer=True, target=True,
+               center=(1074.0, 555.0), radius=93.0):
     frame = np.full((1080, 1920, 3), (60, 120, 90), dtype=np.uint8)
-    cx, cy, radius = 1074.0, 555.0, 93.0
-    left, top = 960, 440
-    crop = frame[top:670, left:1190]
+    cx, cy = center
+    margin = math.ceil(radius * 1.2 + 3)
+    left, top = max(0, math.floor(cx - margin)), max(0, math.floor(cy - margin))
+    right, bottom = min(1920, math.ceil(cx + margin)), min(1080, math.ceil(cy + margin))
+    crop = frame[top:bottom, left:right]
     yy, xx = np.indices(crop.shape[:2])
     distance = np.hypot(xx + left - cx, yy + top - cy)
     angle = np.arctan2(yy + top - cy, xx + left - cx)
@@ -164,6 +169,128 @@ class SyntheticRingTests(unittest.TestCase):
         engine.start(0)
         actions = engine.step(observation, frame.shape, 1.504, captured_at=1.5)
         self.assertEqual([action.kind for action in actions], ["up"])
+
+    @staticmethod
+    def outline_clipped_config(config, center, radius):
+        # Even after normal padding, this rectangle exposes less than 45% of
+        # the circle. Its center and left pointer are outside the first crop,
+        # so recovery cannot depend on already having verified that outline.
+        cx, cy = center
+        config = config.copy()
+        config["charge_region"] = [(cx + radius * 0.45) / 1920,
+                                   (cy - radius * 0.95) / 1080,
+                                   radius * 1.6 / 1920, radius * 1.9 / 1080]
+        return config
+
+    def test_initially_unverified_clipped_outline_is_found_locally_at_multiple_sizes(self):
+        for center, radius in (((980.0, 540.0), 70.0), ((1074.0, 555.0), 93.0),
+                               ((1150.0, 590.0), 115.0)):
+            config = self.outline_clipped_config(self.config, center, radius)
+            for height in (540, 720, 1080, 1440, 2160):
+                with self.subTest(center=center, radius=radius, height=height):
+                    detector = Detector(config.copy(), ROOT / "assets")
+                    # The left pointer is over grey before it reaches a small
+                    # green goal at the top of the same generated circle.
+                    for index, (angle, expected) in enumerate(((math.pi, "up"),
+                                                               (-math.pi / 2, "tap"))):
+                        frame = ring_frame(angle, -math.pi / 2, height=height,
+                                           center=center, radius=radius)
+                        now = 1 + index * 0.02
+                        observation = detector.analyze(frame, now)
+                        self.assertTrue(observation.ring_present)
+                        self.assertIsNotNone(observation.charge)
+                        charge = observation.charge
+                        scale = height / 1080
+                        self.assertAlmostEqual(charge.center[0], center[0] * scale,
+                                               delta=radius * scale * 0.06)
+                        self.assertAlmostEqual(charge.center[1], center[1] * scale,
+                                               delta=radius * scale * 0.06)
+                        self.assertEqual(charge.marker_overlap, expected == "tap")
+                        engine = Engine(config.copy())
+                        engine.start(0)
+                        actions = engine.step(observation, frame.shape, now + 0.004,
+                                              captured_at=now)
+                        self.assertEqual([action.kind for action in actions], [expected])
+
+    def test_local_discovery_does_not_select_a_distant_ring_or_colored_scenery(self):
+        config = self.outline_clipped_config(self.config, (1074.0, 555.0), 93.0)
+        for height in (540, 720, 1080, 1440, 2160):
+            with self.subTest(height=height):
+                # A real-looking ring elsewhere in the scene must not become
+                # the gameplay target, even with green/white scenery nearby.
+                frame = ring_frame(0.0, 0.0, center=(300.0, 250.0))
+                cv2.rectangle(frame, (1080, 520), (1120, 570), (0, 255, 0), -1)
+                cv2.circle(frame, (1140, 555), 10, (255, 255, 255), -1)
+                if height != 1080:
+                    frame = cv2.resize(frame, (round(1920 * height / 1080), height))
+                observation = Detector(config.copy(), ROOT / "assets").analyze(frame, 1)
+                self.assertFalse(observation.ring_present)
+                self.assertIsNone(observation.charge)
+
+    def test_locally_discovered_outline_without_markers_cannot_authorize_a_click(self):
+        config = self.outline_clipped_config(self.config, (1074.0, 555.0), 93.0)
+        for pointer, target in ((True, False), (False, True), (False, False)):
+            with self.subTest(pointer=pointer, target=target):
+                frame = ring_frame(math.pi, pointer=pointer, target=target)
+                observation = Detector(config.copy(), ROOT / "assets").analyze(frame, 1)
+                self.assertTrue(observation.ring_present)
+                self.assertIsNone(observation.charge)
+                engine = Engine(config.copy())
+                engine.start(0)
+                actions = engine.step(observation, frame.shape, 1.004, captured_at=1)
+                self.assertEqual([action.kind for action in actions], ["up"])
+
+
+class SyntheticSaleTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.assets = Path(self.directory.name)
+        self.button = np.zeros((40, 155, 3), dtype=np.uint8)
+        cv2.putText(self.button, "SELL ALL", (3, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        for name in ("sell", "confirm"):
+            self.assertTrue(cv2.imwrite(str(self.assets / f"{name}.png"), self.button))
+        self.config = json.loads((ROOT / "assets" / "default_config.json").read_text(encoding="utf-8"))
+        self.config["template_regions"] = {}
+        self.config["template_source_resolutions"] = {"sell": [1920, 1080], "confirm": [1920, 1080]}
+        self.frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        self.frame[690:730, 1440:1595] = self.button
+
+    def test_flat_correlation_peaks_do_not_hide_distant_sale_button(self):
+        self.config["template_regions"] = {"sell": [0.05, 0.05, 0.07, 0.04]}
+        detector = Detector(self.config, self.assets)
+        match_template = cv2.matchTemplate
+
+        def with_flat_peaks(*args, **kwargs):
+            result = match_template(*args, **kwargs)
+            # Some OpenCV builds return correlation 1.0 on constant black
+            # windows. Reproduce that undefined score independently of the
+            # installed build so the visible real button must still be found.
+            for column in range(5, min(77, result.shape[1]), 6):
+                result[min(5, result.shape[0] - 1), column] = 1.0
+            return result
+
+        with patch("shrooms_macro.vision.cv2.matchTemplate", side_effect=with_flat_peaks):
+            observed = detector.analyze(self.frame, 10.0)
+        self.assertIsNotNone(observed.sell)
+        self.assertAlmostEqual(observed.sell.x, 1517.5, delta=4)
+        self.assertAlmostEqual(observed.sell.y, 710, delta=4)
+        self.assertGreater(observed.sell.score, 0.76)
+
+    def test_global_action_buttons_wait_instead_of_replaying_cached_matches(self):
+        detector = Detector(self.config, self.assets)
+        observed = detector.analyze(self.frame, 10.0)
+        self.assertIsNotNone(observed.sell)
+        self.assertIsNotNone(observed.confirm)
+        with patch.object(detector, "_match_in", wraps=detector._match_in) as scan:
+            gone = detector.analyze(np.zeros_like(self.frame), 10.05)
+        self.assertIsNone(gone.sell)
+        self.assertIsNone(gone.confirm)
+        scan.assert_not_called()
+        refreshed = detector.analyze(self.frame, 10.25)
+        self.assertIsNotNone(refreshed.sell)
+        self.assertIsNotNone(refreshed.confirm)
 
 
 if __name__ == "__main__":

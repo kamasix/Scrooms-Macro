@@ -281,9 +281,9 @@ class MacroUI:
 
     def _sell_every(self) -> int:
         try:
-            return max(1, min(999, int(self.initial.get("sell_every", 10))))
+            return max(1, min(999, int(self.initial.get("sell_every", 1))))
         except (TypeError, ValueError):
-            return 10
+            return 1
 
     def _call(self, name: str, *args: Any) -> Any:
         callback = self.callbacks.get(name)
