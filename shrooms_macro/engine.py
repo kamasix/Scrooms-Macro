@@ -282,13 +282,20 @@ class Engine:
             if circular:
                 actual_delta = (track.marker - track.zone_angle + math.pi) % math.tau - math.pi
                 inside = abs(actual_delta) <= track.zone_size * 0.45
+                observed_inside = inside
                 # Motion may veto a stale overlap, never invent a future one.
                 now_delta = (track.marker + velocity * frame_age - track.zone_angle + math.pi) % math.tau - math.pi
                 inside = inside and abs(now_delta) <= track.zone_size * 0.45
             else:
                 margin = (track.zone_high - track.zone_low) * 0.05
                 inside = track.zone_low + margin <= track.marker <= track.zone_high - margin
-            self.status = "Ring: white pointer outside Perfect"
+                observed_inside = inside
+            if observed_inside and frame_age > 0.025:
+                self.status = f"Ring: frame too old ({frame_age * 1000:.0f} ms) — reading again"
+            elif observed_inside and not inside:
+                self.status = "Ring: pointer moved past Perfect — reading again"
+            else:
+                self.status = "Ring: white pointer outside Perfect"
             self.last_seen = now
             # Never fire a timed click from an abnormally old captured frame.
             if inside and frame_age <= 0.025:

@@ -210,6 +210,7 @@ class Detector:
         self._last_ring_diagnostic = ""
         self._ring_used_cached_geometry = False
         self._last_geometry_retry = -math.inf
+        self._ring_recovered_region: tuple[tuple[int, int], Box, Box] | None = None
         self._scan_cache: dict[str, tuple[float, Match | None]] = {}
         self._features: dict[tuple[Any, ...], np.ndarray] = {}
         self._refresh_templates(force=True)
@@ -431,6 +432,43 @@ class Detector:
                 self._ring_zone = None
         self._ring_geometry = (region, cx, cy, radius)
         return score
+
+    def _recover_ring_crop(self, frame: np.ndarray, base_region: Box, region: Box) -> tuple[np.ndarray, Box] | None:
+        """Complete a clipped, independently verified circle within its local area.
+
+        A manual rectangle can start inside the ring. Enough of the outline may
+        still verify, but a rotating pointer on the omitted side is invisible.
+        Follow only that measured circle, rather than searching the full frame.
+        """
+        if self._ring_geometry is None or self._ring_geometry[0] != region:
+            return None
+        x, y, width, height = region
+        _, cx, cy, radius = self._ring_geometry
+        outer = radius * 1.14 + 2.0
+        if (cx - outer >= 0 and cy - outer >= 0
+                and cx + outer < width and cy + outer < height):
+            return None
+        frame_height, frame_width = frame.shape[:2]
+        global_x, global_y = x + cx, y + cy
+        # The clipped fit can be a few pixels off. Leave room for the fresh
+        # complete-circle fit so its next frame does not need another recrop.
+        margin = radius * 1.30 + 3.0
+        left = max(0, math.floor(global_x - margin))
+        top = max(0, math.floor(global_y - margin))
+        right = min(frame_width, math.ceil(global_x + margin))
+        bottom = min(frame_height, math.ceil(global_y + margin))
+        recovered = (left, top, right - left, bottom - top)
+        if recovered == region or min(recovered[2:]) < 35:
+            return None
+        # Translation keeps the same physical circle and angular target. A
+        # fresh fit below will invalidate that target if the geometry changes.
+        self._ring_geometry = (recovered, global_x - left, global_y - top, radius)
+        if self._ring_zone is not None and self._ring_zone[0] == region:
+            self._ring_zone = (recovered, *self._ring_zone[1:])
+        self._ring_recovered_region = ((frame_height, frame_width), base_region, recovered)
+        crop = frame[top:bottom, left:right]
+        self._ring_outline(crop, recovered, force=True)
+        return crop, recovered
 
     def _ring(self, crop: np.ndarray, region: Box, now: float | None = None) -> BarTrack | None:
         now = time.monotonic() if now is None else now
@@ -780,10 +818,31 @@ class Detector:
             except (TypeError, ValueError):
                 pass
         charge_crop, charge_region = crop_region(frame, normalized)
+        base_charge_crop, base_charge_region = charge_crop, charge_region
+        recovered = self._ring_recovered_region
+        using_recovered = (shape == "ring" and recovered is not None
+                           and recovered[:2] == (frame.shape[:2], base_charge_region))
+        if using_recovered:
+            charge_region = recovered[2]
+            x, y, width, height = charge_region
+            charge_crop = frame[y:y + height, x:x + width]
+        elif recovered is not None:
+            self._ring_recovered_region = None
         charge = None
         if charge_crop.size:
             shape = self.config.get("charge_shape", "ring" if charge_region[2] / max(1, charge_region[3]) < 1.6 else "line")
             charge = self._ring(charge_crop, charge_region, now) if shape == "ring" else self._linear_charge(charge_crop, charge_region)
+            if shape == "ring" and using_recovered and not self._last_ring_present:
+                # A new cast/window layout can move the circle. Revisit the
+                # supplied local rectangle once, without widening the search.
+                self._ring_recovered_region = None
+                charge_crop, charge_region = base_charge_crop, base_charge_region
+                charge = self._ring(charge_crop, charge_region, now)
+            if shape == "ring" and self._last_ring_present:
+                complete = self._recover_ring_crop(frame, base_charge_region, charge_region)
+                if complete is not None:
+                    charge_crop, charge_region = complete
+                    charge = self._ring(charge_crop, charge_region, now)
             if (shape == "ring" and charge is None and self._last_ring_present
                     and self._ring_used_cached_geometry
                     and not self._last_ring_diagnostic.startswith("Multiple white")

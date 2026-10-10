@@ -57,6 +57,7 @@ class Application:
         self.messages = queue.Queue(maxsize=2)
         self.last_keys = {0x75: False, 0x77: False}
         self.saved_counts = (self.engine.caught, self.engine.sold_batches)
+        self.last_frame_metrics = {}
         self.ui = MacroUI(root, {
             "toggle": self.toggle, "stop": self.stop, "refresh": self.windows,
             "select": self.select, "settings": self.settings,
@@ -179,10 +180,17 @@ class Application:
         elif action.kind == "tap":
             if self.engine.phase not in ("charge", "transition"):
                 raise RuntimeError("Stationary clicks are allowed only during Perfect.")
-            if captured_at is not None and time.perf_counter() - captured_at > 0.025:
+            dispatch_age = None if captured_at is None else time.perf_counter() - captured_at
+            metrics = getattr(self, "last_frame_metrics", None)
+            if metrics is not None:
+                metrics["dispatch_age_ms"] = None if dispatch_age is None else round(dispatch_age * 1000, 2)
+                metrics["tap_called"] = False
+            if dispatch_age is not None and dispatch_age > 0.025:
                 self.engine.phase = "charge"
-                self.engine.status = "Ring: reading again — frame was too old"
+                self.engine.status = f"Ring: frame too old ({dispatch_age * 1000:.0f} ms) — reading again"
                 return
+            if metrics is not None:
+                metrics["tap_called"] = True
             self.desktop.tap(self.target, cancel=self.input_cancel)
         elif action.kind == "click":
             if not self.engine.phase.startswith("sell"):
@@ -204,15 +212,30 @@ class Application:
                         raise InputUnavailable("Paused: return to Roblox and press F6")
                     capture_started = time.perf_counter()
                     frame = self.desktop.capture(target)
-                    captured_at = (capture_started + time.perf_counter()) * 0.5
+                    capture_finished = time.perf_counter()
+                    captured_at = (capture_started + capture_finished) * 0.5
+                    analysis_started = time.perf_counter()
                     with self.detector_lock:
                         obs = detector.analyze(frame, captured_at)
+                    analysis_finished = time.perf_counter()
                     with self.control_lock:
                         if (not self.active.is_set() or generation != self.generation
                                 or self.input_cancel.is_set()):
                             continue
-                        actions = self.engine.step(obs, frame.shape, time.perf_counter(),
+                        decision_time = time.perf_counter()
+                        self.last_frame_metrics = {
+                            "capture_ms": round((capture_finished - capture_started) * 1000, 2),
+                            "analysis_ms": round((analysis_finished - analysis_started) * 1000, 2),
+                            "decision_age_ms": round((decision_time - captured_at) * 1000, 2),
+                            "ring_present": obs.ring_present,
+                            "ring_recognized": obs.charge is not None,
+                            "ring_diagnostic": obs.ring_diagnostic,
+                            "tap_called": False,
+                        }
+                        actions = self.engine.step(obs, frame.shape, decision_time,
                                                    captured_at=captured_at)
+                        self.last_frame_metrics["tap_requested"] = any(action.kind == "tap" for action in actions)
+                        self.last_frame_metrics["decision_status"] = self.engine.status
                         for action in actions:
                             if not self.active.is_set() or self.input_cancel.is_set():
                                 break
@@ -372,12 +395,15 @@ class Application:
             stamp = time.strftime("%Y%m%d-%H%M%S")
             with self.detector_lock:
                 obs = self.detector.analyze(frame, time.perf_counter())
+            with self.control_lock:
+                metrics = dict(self.last_frame_metrics)
             save_image(folder / (stamp + "-screen.png"), frame)
             save_image(folder / (stamp + "-detection.png"), self.detector.annotate(frame, obs))
             (folder / (stamp + ".json")).write_text(json.dumps({
                 "dpi": DPI_AWARENESS, "size": [frame.shape[1], frame.shape[0]],
                 "missing": self.detector.ready(), "phase": self.engine.phase,
                 "observation": str(obs),
+                "last_worker_frame": metrics,
             }, ensure_ascii=False, indent=2), encoding="utf-8")
             self.ui.update_status(self.snapshot("Local snapshots saved in the diagnostics folder."))
         self.capture_after_countdown(save, "image diagnostics")

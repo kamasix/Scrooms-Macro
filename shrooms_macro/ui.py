@@ -6,6 +6,8 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Any, Callable
 
+from . import __version__
+
 
 class MacroUI:
     """Tkinter view. All methods and callbacks run on the Tk main thread."""
@@ -30,7 +32,7 @@ class MacroUI:
         self._window_choices: dict[str, int] = {}
         self._fit_job: str | None = None
 
-        root.title("Shrooms Macro")
+        root.title(f"Shrooms Macro {__version__}")
         root.configure(bg=self.BG)
         root.geometry("326x350+18+78")
         root.resizable(False, False)

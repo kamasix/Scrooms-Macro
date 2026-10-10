@@ -4,7 +4,7 @@ A small Windows desktop macro for SCROOMS. It reads the visible Roblox window an
 
 ## Download and use
 
-Download `ShroomsMacro-1.0.4.exe` from [Releases](https://github.com/kamasix/Scrooms-Macro/releases). Place it in a writable folder and run it; Python is not required for the EXE.
+Download `ShroomsMacro-1.0.5.exe` from [Releases](https://github.com/kamasix/Scrooms-Macro/releases). Place it in a writable folder and run it; Python is not required for the EXE.
 
 1. Open SCROOMS in Roblox, stand where you want to catch, and equip your instrument.
 2. Select the Roblox window in the macro. Refresh the list if necessary.
@@ -18,6 +18,7 @@ Use **Join Discord** at the bottom of the window or [join the community here](ht
 ## What it does
 
 - Detects the rotating white pointer and narrow green **Perfect** segment. A click requires an observed overlap in a fresh frame.
+- Recovers the complete ring from its verified outline if a saved calibration clips the pointer, and keeps that analysis region while the ring stays visible.
 - Matches Frequency and follows the moving catch field: **hold left mouse to move right; release to move left**.
 - Keeps the physical cursor still during minigames. Selling is the only stage that moves it to a detected button.
 - After 10 detected catches by default, opens inventory with the backtick/tilde key and clicks **Sell All** twice, using a fresh button detection for each click.
@@ -30,6 +31,8 @@ The sale counter records completed input sequences; it does not read the game's 
 The default regions come from a widescreen layout and scale with the selected game's client area. Windows DPI and monitor offsets are handled in physical pixels, including monitors to the left of the primary display. Other aspect ratios, moved UI, or game updates can still require calibration.
 
 Open **Settings & calibration**, choose the relevant element, then show it in Roblox during the three-second countdown. Select it in the frozen image and press Enter to save or Escape to cancel. Use **Preview** to inspect recognition. **Diagnostics** saves images and recognition details locally; review and crop them before sharing.
+
+Ring status distinguishes a missing pointer or target from a frame that became too old to click. Local diagnostics include the previous worker frame's capture time, analysis time, frame age, and click decision.
 
 If the sale has a separate confirmation button, calibrate **Sale confirmation**. The stock layout expects a second click on Sell All. The inventory key uses the Windows OEM backtick/tilde key; keyboard layouts or game bindings can differ.
 
