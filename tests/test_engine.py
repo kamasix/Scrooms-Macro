@@ -96,6 +96,58 @@ class EngineChecks(unittest.TestCase):
         actions = self.engine.step(Observation(charge=second), (1080, 1920, 3), 1.07, captured_at=1.05)
         self.assertEqual([a.kind for a in actions], ["up"])
 
+    def test_ring_rejects_overlap_if_input_latency_would_land_after_perfect(self):
+        self.config["input_latency"] = .008
+        region = (100, 100, 180, 180)
+        first = BarTrack(region, .90, .95, 1.05, "angle", .99)
+        late = BarTrack(region, 1.02, .95, 1.05, "angle", .99)
+        self.step(Observation(charge=first), .98)
+        # The captured pointer is green and the frame is fresh, but 6 rad/s
+        # advances another .048 rad before the click reaches the game.
+        actions = self.step(Observation(charge=late), 1)
+        self.assertEqual([a.kind for a in actions], ["up"])
+        self.assertEqual(self.engine.phase, "charge")
+
+    def test_ring_clicks_at_early_overlap_when_latency_impact_stays_in_perfect(self):
+        self.config["input_latency"] = .008
+        region = (100, 100, 180, 180)
+        first = BarTrack(region, .890, .95, 1.05, "angle", .99)
+        early = BarTrack(region, .958, .95, 1.05, "angle", .99)
+        self.step(Observation(charge=first), .98)
+        # Observed early in green, not on grey; 4 ms frame age + 8 ms input
+        # delay places this 3.4 rad/s pointer close to the target center.
+        actions = self.engine.step(Observation(charge=early), (1080, 1920, 3),
+                                   1.004, captured_at=1)
+        self.assertEqual([a.kind for a in actions], ["tap"])
+
+    def test_ring_latency_projection_cannot_trigger_from_fresh_observed_grey(self):
+        self.config["input_latency"] = .008
+        region = (100, 100, 180, 180)
+        self.step(Observation(charge=BarTrack(region, .84, .95, 1.05, "angle", .99)), .98)
+        # Projection reaches .98 (inside Perfect), but the observed .94 is
+        # outside the narrow green. This must never authorize an early click.
+        actions = self.step(Observation(charge=BarTrack(region, .94, .95, 1.05, "angle", .99)), 1)
+        self.assertEqual([a.kind for a in actions], ["up"])
+
+    def test_ring_latency_works_in_reverse_rotation_at_the_other_entry_edge(self):
+        self.config["input_latency"] = .008
+        region = (100, 100, 180, 180)
+        self.step(Observation(charge=BarTrack(region, 1.130, .95, 1.05, "angle", .99)), .98)
+        actions = self.step(Observation(charge=BarTrack(region, 1.042, .95, 1.05, "angle", .99)), 1)
+        self.assertEqual([a.kind for a in actions], ["tap"])
+
+    def test_ring_latency_uses_preserved_duplicate_frame_speed_across_angle_zero(self):
+        self.config["input_latency"] = .008
+        region = (100, 100, 180, 180)
+        for angle, now in ((6.05, .96), (6.13, .98), (6.13, .985)):
+            actions = self.step(Observation(charge=BarTrack(region, angle, 6.20, .08, "angle", .99)), now)
+            self.assertEqual([a.kind for a in actions], ["up"])
+        self.assertAlmostEqual(self.engine._charge_velocity(6.13, .988, True), 4)
+        early = BarTrack(region, 6.21, 6.20, .08, "angle", .99)
+        actions = self.engine.step(Observation(charge=early), (1080, 1920, 3),
+                                   1.004, captured_at=1)
+        self.assertEqual([a.kind for a in actions], ["tap"])
+
     def test_lost_ring_never_becomes_an_unobserved_fresh_press(self):
         ring = BarTrack((100, 100, 180, 180), .5, 4.05, 4.22, "angle", .99)
         self.step(Observation(charge=ring), 1)

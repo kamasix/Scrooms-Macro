@@ -257,18 +257,42 @@ class PointerGuardTests(unittest.TestCase):
                 for call in self.desktop._send_raw.call_args_list]
 
     def test_sale_click_holds_for_a_renderable_frame_and_releases(self):
-        self.desktop.move = MagicMock()
+        trace = []
+        self.desktop.move = MagicMock(side_effect=lambda *_args: trace.append("move"))
         signal = self._cancel_signal()
 
         def observe_press(duration):
-            self.assertEqual(duration, 0.040)
-            self.assertTrue(self.desktop._left_held)
-            self.assertEqual(self.mouse_events(), [0x0002])
+            trace.append(("wait", duration))
+            if duration == 0.080:
+                self.assertTrue(self.desktop._left_held)
+                self.assertEqual(self.mouse_events(), [0x0002])
+            else:
+                self.assertFalse(self.desktop._left_held)
+                self.assertEqual(self.mouse_events(), [])
             return False
 
+        def send_input(items):
+            trace.append(("input", items[0].mi.dwFlags))
+            return 1
+
+        self.desktop._send_raw.side_effect = send_input
         signal.wait.side_effect = observe_press
         self.desktop.click(self.TARGET, 230, 170, cancel=signal)
-        self.desktop.move.assert_called_once_with(self.TARGET, 230, 170)
+        self.assertEqual(self.desktop.move.call_count, 8)
+        self.desktop.move.assert_called_with(self.TARGET, 230, 170)
+        self.assertEqual(trace, [item for _ in range(8) for item in ("move", ("wait", 0.010))]
+                         + [("wait", 0.060), ("input", 0x0002),
+                            ("wait", 0.080), ("input", 0x0004)])
+        positions = [call.args[1:] for call in self.desktop.move.call_args_list]
+        previous = (90, 80)  # Physical cursor (100, 100), client origin (10, 20).
+        deltas = []
+        for position in positions:
+            self.assertGreater(position[0], previous[0])
+            self.assertGreater(position[1], previous[1])
+            deltas.append(position[0] - previous[0])
+            previous = position
+        self.assertLess(deltas[0], deltas[3])
+        self.assertLess(deltas[-1], deltas[4])
         self.assertEqual(self.mouse_events(), [0x0002, 0x0004])
         self.assertFalse(self.desktop._left_held)
 
@@ -295,7 +319,8 @@ class PointerGuardTests(unittest.TestCase):
         signal = self._cancel_signal()
 
         def cancel_during_press(duration):
-            self.assertEqual(duration, 0.040)
+            if duration != 0.080:
+                return False
             signal.is_set.return_value = True
             self.desktop.is_foreground.return_value = False
             return True
@@ -316,7 +341,13 @@ class PointerGuardTests(unittest.TestCase):
     def test_sale_wait_exception_still_releases_owned_press(self):
         self.desktop.move = MagicMock()
         signal = self._cancel_signal()
-        signal.wait.side_effect = RuntimeError("mock cancelled wait")
+
+        def fail_during_press(duration):
+            if duration == 0.080:
+                raise RuntimeError("mock cancelled wait")
+            return False
+
+        signal.wait.side_effect = fail_during_press
         with self.assertRaises(RuntimeError):
             self.desktop.click(self.TARGET, 230, 170, cancel=signal)
         self.assertEqual(self.mouse_events(), [0x0002, 0x0004])
@@ -338,7 +369,9 @@ class PointerGuardTests(unittest.TestCase):
         self.desktop.move = MagicMock()
         signal = self._cancel_signal()
 
-        def close_during_press(_duration):
+        def close_during_press(duration):
+            if duration != 0.080:
+                return False
             closer = threading.Thread(target=self.desktop.close)
             closer.start()
             closer.join(timeout=1)
@@ -349,6 +382,90 @@ class PointerGuardTests(unittest.TestCase):
         signal.wait.side_effect = close_during_press
         self.desktop.click(self.TARGET, 230, 170, cancel=signal)
         self.assertEqual(self.mouse_events(), [0x0002, 0x0004])
+
+    def test_sale_cancelled_during_smooth_movement_never_presses(self):
+        self.desktop.move = MagicMock()
+        signal = self._cancel_signal()
+
+        def cancel_after_third_step(duration):
+            self.assertEqual(duration, 0.010)
+            if self.desktop.move.call_count == 3:
+                signal.is_set.return_value = True
+                return True
+            return False
+
+        signal.wait.side_effect = cancel_after_third_step
+        self.desktop.click(self.TARGET, 230, 170, cancel=signal)
+        self.assertEqual(self.desktop.move.call_count, 3)
+        self.desktop._send_raw.assert_not_called()
+
+    def test_sale_cancelled_during_hover_settle_never_presses(self):
+        self.desktop.move = MagicMock()
+        signal = self._cancel_signal()
+
+        def cancel_during_hover(duration):
+            if duration == 0.060:
+                signal.is_set.return_value = True
+                return True
+            return False
+
+        signal.wait.side_effect = cancel_during_hover
+        self.desktop.click(self.TARGET, 230, 170, cancel=signal)
+        self.assertEqual(self.desktop.move.call_count, 8)
+        self.assertEqual(signal.wait.call_count, 9)
+        self.desktop._send_raw.assert_not_called()
+
+    def test_sale_focus_loss_during_movement_stops_before_next_step(self):
+        self.desktop.move = MagicMock()
+        signal = self._cancel_signal()
+
+        def lose_focus_during_movement(_duration):
+            if self.desktop.move.call_count == 2:
+                self.desktop.is_foreground.return_value = False
+            return False
+
+        signal.wait.side_effect = lose_focus_during_movement
+        with self.assertRaises(platform.InputUnavailable):
+            self.desktop.click(self.TARGET, 230, 170, cancel=signal)
+        self.assertEqual(self.desktop.move.call_count, 2)
+        self.desktop._send_raw.assert_not_called()
+
+    def test_sale_focus_loss_during_hover_refuses_final_press(self):
+        self.desktop.move = MagicMock()
+        signal = self._cancel_signal()
+
+        def lose_focus_during_hover(duration):
+            if duration == 0.060:
+                self.desktop.is_foreground.return_value = False
+            return False
+
+        signal.wait.side_effect = lose_focus_during_hover
+        with self.assertRaises(platform.InputUnavailable):
+            self.desktop.click(self.TARGET, 230, 170, cancel=signal)
+        self.assertEqual(self.desktop.move.call_count, 8)
+        self.desktop._send_raw.assert_not_called()
+
+    def test_all_sale_waits_allow_another_thread_to_acquire_input_lock(self):
+        self.desktop.move = MagicMock()
+        signal = self._cancel_signal()
+
+        def check_unlocked_wait(_duration):
+            acquired = threading.Event()
+
+            def acquire_input_lock():
+                with self.desktop._input_lock:
+                    acquired.set()
+
+            cleanup = threading.Thread(target=acquire_input_lock)
+            cleanup.start()
+            cleanup.join(timeout=1)
+            self.assertFalse(cleanup.is_alive())
+            self.assertTrue(acquired.is_set())
+            return False
+
+        signal.wait.side_effect = check_unlocked_wait
+        self.desktop.click(self.TARGET, 230, 170, cancel=signal)
+        self.assertEqual(signal.wait.call_count, 10)
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows backend")

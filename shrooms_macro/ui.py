@@ -47,6 +47,7 @@ class MacroUI:
         self.warning_var = tk.StringVar(value="")
         self.window_var = tk.StringVar(value="Select game window…")
         self.sell_every_var = tk.StringVar(value=str(self._sell_every()))
+        self.perfect_ms_var = tk.StringVar(value=str(self._perfect_ms()))
         self.topmost_var = tk.BooleanVar(value=bool(self.initial.get("always_on_top", True)))
 
         content = tk.Frame(root, bg=self.BG)
@@ -216,6 +217,25 @@ class MacroUI:
         self.sell_spin.bind("<Return>", lambda _event: self._save_settings())
         self._label(settings_row, "shrooms", bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 9)).pack(side="right", padx=(4, 7))
 
+        timing_row = tk.Frame(inner, bg=self.CARD)
+        timing_row.pack(fill="x", pady=(8, 0))
+        self._label(timing_row, "Perfect correction", bg=self.CARD, fg=self.MUTED,
+                    font=("Segoe UI", 9)).pack(side="left")
+        timing_spin = tk.Spinbox(
+            timing_row, from_=0, to=120, width=4, textvariable=self.perfect_ms_var,
+            bg=self.FIELD, fg=self.TEXT, insertbackground=self.TEXT,
+            buttonbackground=self.FIELD, relief="flat", highlightthickness=1,
+            highlightbackground=self.BORDER, highlightcolor=self.GREEN,
+            font=("Segoe UI", 9), command=self._save_settings,
+        )
+        timing_spin.pack(side="right")
+        timing_spin.bind("<FocusOut>", lambda _event: self._save_settings())
+        timing_spin.bind("<Return>", lambda _event: self._save_settings())
+        self._label(timing_row, "ms", bg=self.CARD, fg=self.MUTED,
+                    font=("Segoe UI", 9)).pack(side="right", padx=(4, 7))
+        self._label(inner, "Increase if Perfect clicks land late.", bg=self.CARD,
+                    fg=self.MUTED, font=("Segoe UI", 8)).pack(fill="x", pady=(3, 0))
+
         tk.Checkbutton(
             inner, text="Always on top", variable=self.topmost_var,
             command=self._save_settings, bg=self.CARD, fg=self.TEXT,
@@ -285,6 +305,12 @@ class MacroUI:
         except (TypeError, ValueError):
             return 1
 
+    def _perfect_ms(self) -> int:
+        try:
+            return max(0, min(120, round(float(self.initial.get("input_latency", 0.008)) * 1000)))
+        except (TypeError, ValueError, OverflowError):
+            return 8
+
     def _call(self, name: str, *args: Any) -> Any:
         callback = self.callbacks.get(name)
         if callback is None:
@@ -334,8 +360,14 @@ class MacroUI:
         except (TypeError, ValueError):
             sell_every = self._sell_every()
         self.sell_every_var.set(str(sell_every))
+        try:
+            perfect_ms = max(0, min(120, round(float(self.perfect_ms_var.get()))))
+        except (TypeError, ValueError, OverflowError):
+            perfect_ms = self._perfect_ms()
+        self.perfect_ms_var.set(str(perfect_ms))
         settings = {
             "sell_every": sell_every,
+            "input_latency": perfect_ms / 1000,
             "always_on_top": bool(self.topmost_var.get()),
         }
         self.initial.update(settings)

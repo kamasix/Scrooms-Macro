@@ -4,7 +4,7 @@ A small Windows desktop macro for SCROOMS. It reads the visible Roblox window an
 
 ## Download and use
 
-Download `ShroomsMacro-1.0.6.exe` from [Releases](https://github.com/kamasix/Scrooms-Macro/releases). Place it in a writable folder and run it; Python is not required for the EXE.
+Download `ShroomsMacro-1.0.7.exe` from [Releases](https://github.com/kamasix/Scrooms-Macro/releases). Place it in a writable folder and run it; Python is not required for the EXE.
 
 1. Open SCROOMS in Roblox, stand where you want to catch, and equip your instrument.
 2. Select the Roblox window in the macro. Refresh the list if necessary.
@@ -17,12 +17,12 @@ Use **Join Discord** at the bottom of the window or [join the community here](ht
 
 ## What it does
 
-- Detects the rotating white pointer and narrow green **Perfect** segment. A click requires an observed overlap in a fresh frame.
+- Detects the rotating white pointer and narrow green **Perfect** segment. A click requires an observed overlap in a fresh frame and an estimated arrival that stays inside Perfect after input latency.
 - Searches a limited neighborhood when a saved calibration clips too much of the ring to recognize its outline, then keeps the verified complete ring region while it stays visible.
 - Matches Frequency and follows the moving catch field: **hold left mouse to move right; release to move left**.
 - Keeps the physical cursor still during minigames. Selling is the only stage that moves it to a detected button.
 - After each detected catch by default, presses the backtick/tilde key, detects **Sell All**, clicks it twice using fresh button detections, then presses backtick/tilde again to close inventory. The catch interval is adjustable in Settings.
-- Holds inventory keys and sale clicks for up to 40 ms so the game can observe them. Stop interrupts these presses and releases the macro's inputs.
+- Moves smoothly to sale buttons, lets the hover position settle, then holds the click for up to 80 ms. Inventory keys use a 40 ms press. Stop interrupts movement, waits, and presses and releases owned inputs.
 - Pauses if Roblox loses focus, a control cannot be detected, or a stage times out. It preserves the catch count if it cannot find the sell button.
 
 The sale counter records completed input sequences; it does not read the game's currency balance.
@@ -36,6 +36,8 @@ The default regions come from a widescreen layout and scale with the selected ga
 Open **Settings & calibration**, choose the relevant element, then show it in Roblox during the three-second countdown. Select it in the frozen image and press Enter to save or Escape to cancel. Use **Preview** to inspect recognition. **Diagnostics** saves images and recognition details locally; review and crop them before sharing.
 
 Ring status distinguishes a missing pointer or target from a frame that became too old to click. Local diagnostics include the previous worker frame's capture time, analysis time, frame age, and click decision.
+
+**Perfect correction** adjusts estimated input latency in milliseconds, starting at 8 ms. Increase it if clicks consistently land after the small Perfect segment. This only rejects clicks projected to arrive too late; it never permits clicking while the observed pointer is outside Perfect.
 
 If the sale has a separate confirmation button, calibrate **Sale confirmation**. The stock layout expects a second click on Sell All. The inventory key uses the Windows OEM backtick/tilde key; keyboard layouts or game bindings can differ.
 

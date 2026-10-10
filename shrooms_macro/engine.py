@@ -281,19 +281,29 @@ class Engine:
             velocity = self._charge_velocity(track.marker, sample_time, circular)
             if circular:
                 actual_delta = (track.marker - track.zone_angle + math.pi) % math.tau - math.pi
-                inside = abs(actual_delta) <= track.zone_size * 0.45
-                observed_inside = inside
-                # Motion may veto a stale overlap, never invent a future one.
-                now_delta = (track.marker + velocity * frame_age - track.zone_angle + math.pi) % math.tau - math.pi
-                inside = inside and abs(now_delta) <= track.zone_size * 0.45
+                half_zone = track.zone_size * 0.45
+                observed_inside = abs(actual_delta) <= half_zone
+                # The marker must already be visibly inside narrow Perfect.
+                # Account for capture age and the configured input delay so
+                # an observed late-edge overlap cannot land in broad green.
+                # Keep the projected delta unwrapped: a full revolution must
+                # never turn a passed target into a safe current overlap.
+                now_delta = actual_delta + velocity * frame_age
+                current_inside = abs(now_delta) <= half_zone
+                input_delay = self._setting("input_latency", 0.008, 0, 0.12)
+                impact_delta = actual_delta + velocity * (frame_age + input_delay)
+                impact_inside = abs(impact_delta) <= half_zone
+                inside = observed_inside and current_inside and impact_inside
             else:
                 margin = (track.zone_high - track.zone_low) * 0.05
                 inside = track.zone_low + margin <= track.marker <= track.zone_high - margin
-                observed_inside = inside
+                observed_inside = current_inside = impact_inside = inside
             if observed_inside and frame_age > 0.025:
                 self.status = f"Ring: frame too old ({frame_age * 1000:.0f} ms) — reading again"
-            elif observed_inside and not inside:
+            elif observed_inside and not current_inside:
                 self.status = "Ring: pointer moved past Perfect — reading again"
+            elif observed_inside and not impact_inside:
+                self.status = "Ring: click would arrive after Perfect — waiting"
             else:
                 self.status = "Ring: white pointer outside Perfect"
             self.last_seen = now

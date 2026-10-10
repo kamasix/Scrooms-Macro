@@ -469,24 +469,56 @@ class Desktop:
             except Exception:
                 pass  # Retain ownership so later cleanup can retry the release.
 
+    def _move_sale(self, hwnd: int, x: float, y: float,
+                   cancel: threading.Event) -> bool:
+        """Ease toward a sale button in eight guarded, cancellable steps."""
+        with self._input_lock:
+            if cancel.is_set():
+                return False
+            self._guard(hwnd)
+            if not math.isfinite(x) or not math.isfinite(y):
+                raise ValueError("Mouse coordinates must be finite.")
+            bounds = self.client_rect(hwnd)
+            screen_x, screen_y = self.mouse_position()
+            start_x = max(0, min(bounds.width - 1, screen_x - bounds.left))
+            start_y = max(0, min(bounds.height - 1, screen_y - bounds.top))
+            end_x = max(0, min(bounds.width - 1, x))
+            end_y = max(0, min(bounds.height - 1, y))
+        for step in range(1, 9):
+            with self._input_lock:
+                if cancel.is_set():
+                    return False
+                self._guard(hwnd)
+                progress = step / 8
+                eased = progress * progress * (3 - 2 * progress)
+                self.move(hwnd, start_x + (end_x - start_x) * eased,
+                          start_y + (end_y - start_y) * eased)
+                if cancel.is_set():
+                    return False
+            if cancel.wait(0.010):
+                return False
+        return True
+
     def click(self, hwnd: int, x: float, y: float,
               cancel: threading.Event | None = None) -> None:
-        """Click a sale button with a cancellable, renderable 40 ms press."""
+        """Ease to a sale button, settle for 60 ms, then press for up to 80 ms."""
+        signal = cancel if cancel is not None else threading.Event()
         try:
             with self._input_lock:
                 self.mouse_up()
                 if self._left_held:
                     raise InputUnavailable("Windows did not release the previous mouse press.")
-                if cancel is not None and cancel.is_set():
+                if signal.is_set():
                     return
-                self.move(hwnd, x, y)
-                if cancel is not None and cancel.is_set():
+            if not self._move_sale(hwnd, x, y, signal):
+                return
+            if signal.wait(0.060):
+                return
+            with self._input_lock:
+                if signal.is_set():
                     return
                 self.mouse_down(hwnd)
-            if cancel is not None:
-                cancel.wait(0.040)
-            else:
-                threading.Event().wait(0.040)
+            signal.wait(0.080)
         finally:
             self.mouse_up()
         if self._left_held:
