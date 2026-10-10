@@ -114,42 +114,79 @@ class PointerGuardTests(unittest.TestCase):
         return [(call.args[0][0].ki.wVk, call.args[0][0].ki.dwFlags)
                 for call in self.desktop._send_raw.call_args_list]
 
+    def keyboard_packets(self):
+        return [(call.args[0][0].ki.wVk, call.args[0][0].ki.wScan,
+                 call.args[0][0].ki.dwFlags)
+                for call in self.desktop._send_raw.call_args_list]
+
     def test_inventory_key_has_a_renderable_hold_before_release(self):
         signal = self._cancel_signal()
 
         def observe_press(duration):
-            self.assertEqual(duration, 0.040)
+            self.assertEqual(duration, 0.100)
             self.assertEqual(self.desktop._held_key, platform.VK_OEM_3)
-            self.assertEqual(self.keyboard_events(), [(platform.VK_OEM_3, 0)])
+            self.assertEqual(self.keyboard_packets(), [(0, 0x29, 0x0008)])
             return False
 
         signal.wait.side_effect = observe_press
+        self.assertIs(self.desktop.key(self.TARGET, platform.VK_OEM_3, cancel=signal), True)
+        self.assertEqual(self.keyboard_packets(), [(0, 0x29, 0x0008),
+                                                   (0, 0x29, 0x000A)])
+        self.assertIsNone(self.desktop._held_key)
+        self.assertIsNone(self.desktop._held_key_up_packet)
+
+    def test_generic_virtual_key_packet_and_40ms_hold_are_unchanged(self):
+        signal = self._cancel_signal()
+
+        def observe_press(duration):
+            self.assertEqual(duration, 0.040)
+            self.assertEqual(self.keyboard_packets(), [(0x41, 0, 0)])
+            return False
+
+        signal.wait.side_effect = observe_press
+        self.assertIs(self.desktop.key(self.TARGET, 0x41, cancel=signal), True)
+        self.assertEqual(self.keyboard_packets(), [(0x41, 0, 0), (0x41, 0, 0x0002)])
+        self.assertIsNone(self.desktop._held_key_up_packet)
+
+    def test_inventory_release_uses_original_packet_after_mapping_and_focus_change(self):
+        signal = self._cancel_signal()
+        packet_builder = patch.object(platform, "_keyboard_input",
+                                      side_effect=AssertionError("held release was rebuilt"))
+
+        def change_mapping_while_held(duration):
+            self.assertEqual(duration, 0.100)
+            self.desktop.is_foreground.return_value = False
+            packet_builder.start()
+            self.addCleanup(packet_builder.stop)
+            return False
+
+        signal.wait.side_effect = change_mapping_while_held
         self.desktop.key(self.TARGET, platform.VK_OEM_3, cancel=signal)
-        self.assertEqual(self.keyboard_events(), [(platform.VK_OEM_3, 0),
-                                                  (platform.VK_OEM_3, 0x0002)])
+        self.assertEqual(self.keyboard_packets(), [(0, 0x29, 0x0008),
+                                                   (0, 0x29, 0x000A)])
         self.assertIsNone(self.desktop._held_key)
 
     def test_cancelled_key_does_not_press_or_wait(self):
         signal = self._cancel_signal()
         signal.is_set.return_value = True
-        self.desktop.key(self.TARGET, platform.VK_OEM_3, cancel=signal)
+        self.assertIs(self.desktop.key(self.TARGET, platform.VK_OEM_3, cancel=signal), False)
         self.desktop._send_raw.assert_not_called()
         signal.wait.assert_not_called()
         self.assertIsNone(self.desktop._held_key)
+        self.assertIsNone(self.desktop._held_key_up_packet)
 
     def test_cancellation_during_key_hold_releases_after_focus_loss(self):
         signal = self._cancel_signal()
 
         def cancel_during_press(duration):
-            self.assertEqual(duration, 0.040)
+            self.assertEqual(duration, 0.100)
             signal.is_set.return_value = True
             self.desktop.is_foreground.return_value = False
             return True
 
         signal.wait.side_effect = cancel_during_press
-        self.desktop.key(self.TARGET, platform.VK_OEM_3, cancel=signal)
-        self.assertEqual(self.keyboard_events(), [(platform.VK_OEM_3, 0),
-                                                  (platform.VK_OEM_3, 0x0002)])
+        self.assertIs(self.desktop.key(self.TARGET, platform.VK_OEM_3, cancel=signal), True)
+        self.assertEqual(self.keyboard_events(), [(0, 0x0008), (0, 0x000A)])
         self.assertIsNone(self.desktop._held_key)
 
     def test_rejected_key_down_has_no_unowned_release(self):
@@ -157,9 +194,10 @@ class PointerGuardTests(unittest.TestCase):
         signal = self._cancel_signal()
         with self.assertRaises(platform.InputUnavailable):
             self.desktop.key(self.TARGET, platform.VK_OEM_3, cancel=signal)
-        self.assertEqual(self.keyboard_events(), [(platform.VK_OEM_3, 0)])
+        self.assertEqual(self.keyboard_events(), [(0, 0x0008)])
         signal.wait.assert_not_called()
         self.assertIsNone(self.desktop._held_key)
+        self.assertIsNone(self.desktop._held_key_up_packet)
 
     def test_failed_key_release_keeps_ownership_for_shutdown_retry(self):
         self.desktop._send_raw.side_effect = [1, 0]
@@ -167,12 +205,17 @@ class PointerGuardTests(unittest.TestCase):
             self.desktop.key(self.TARGET, platform.VK_OEM_3,
                              cancel=self._cancel_signal())
         self.assertEqual(self.desktop._held_key, platform.VK_OEM_3)
+        packet = self.desktop._held_key_up_packet
+        self.assertIsNotNone(packet)
+        self.assertIs(self.desktop._send_raw.call_args.args[0][0], packet)
         self.desktop._send_raw.side_effect = None
         self.desktop.close()
         self.assertIsNone(self.desktop._held_key)
-        self.assertEqual(self.keyboard_events(), [(platform.VK_OEM_3, 0),
-                                                  (platform.VK_OEM_3, 0x0002),
-                                                  (platform.VK_OEM_3, 0x0002)])
+        self.assertIs(self.desktop._send_raw.call_args.args[0][0], packet)
+        self.assertIsNone(self.desktop._held_key_up_packet)
+        self.assertEqual(self.keyboard_packets(), [(0, 0x29, 0x0008),
+                                                   (0, 0x29, 0x000A),
+                                                   (0, 0x29, 0x000A)])
 
     def test_key_release_exception_can_be_retried_by_shutdown(self):
         self.desktop._send_raw.side_effect = [1, OSError("mock release failure")]
@@ -189,8 +232,7 @@ class PointerGuardTests(unittest.TestCase):
         signal.wait.side_effect = RuntimeError("mock cancelled wait")
         with self.assertRaises(RuntimeError):
             self.desktop.key(self.TARGET, platform.VK_OEM_3, cancel=signal)
-        self.assertEqual(self.keyboard_events(), [(platform.VK_OEM_3, 0),
-                                                  (platform.VK_OEM_3, 0x0002)])
+        self.assertEqual(self.keyboard_events(), [(0, 0x0008), (0, 0x000A)])
         self.assertIsNone(self.desktop._held_key)
 
     def test_shutdown_can_release_key_while_hold_wait_is_running(self):
@@ -208,8 +250,7 @@ class PointerGuardTests(unittest.TestCase):
 
         signal.wait.side_effect = close_during_press
         self.desktop.key(self.TARGET, platform.VK_OEM_3, cancel=signal)
-        self.assertEqual(self.keyboard_events(), [(platform.VK_OEM_3, 0),
-                                                  (platform.VK_OEM_3, 0x0002)])
+        self.assertEqual(self.keyboard_events(), [(0, 0x0008), (0, 0x000A)])
 
     def test_key_foreground_guard_rejects_press_before_input(self):
         self.desktop.is_foreground.return_value = False
@@ -223,8 +264,7 @@ class PointerGuardTests(unittest.TestCase):
         self.desktop.key(self.TARGET, platform.VK_OEM_3,
                          cancel=self._cancel_signal())
         self.assertEqual(self.keyboard_events(), [(0x41, 0x0002),
-                                                  (platform.VK_OEM_3, 0),
-                                                  (platform.VK_OEM_3, 0x0002)])
+                                                  (0, 0x0008), (0, 0x000A)])
 
     def test_failed_previous_key_release_prevents_another_key_down(self):
         self.desktop._held_key = 0x41
@@ -243,14 +283,16 @@ class PointerGuardTests(unittest.TestCase):
 
     def test_key_up_retries_owned_release_without_foreground_requirement(self):
         self.desktop._held_key = platform.VK_OEM_3
+        self.desktop._held_key_up_packet = platform._keyboard_input(
+            platform.VK_OEM_3, True, scan_code=0x29)
         self.desktop.is_foreground.return_value = False
         self.desktop._send_raw.side_effect = [0, 1]
         self.assertFalse(self.desktop.key_up())
         self.assertEqual(self.desktop._held_key, platform.VK_OEM_3)
         self.assertTrue(self.desktop.key_up())
         self.assertIsNone(self.desktop._held_key)
-        self.assertEqual(self.keyboard_events(), [(platform.VK_OEM_3, 0x0002),
-                                                  (platform.VK_OEM_3, 0x0002)])
+        self.assertEqual(self.keyboard_packets(), [(0, 0x29, 0x000A),
+                                                   (0, 0x29, 0x000A)])
 
     def mouse_events(self):
         return [call.args[0][0].mi.dwFlags

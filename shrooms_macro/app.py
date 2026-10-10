@@ -23,6 +23,7 @@ from .config import Profile, application_dir
 from .engine import Engine
 from .ui import MacroUI
 from .vision import Detector
+from . import __version__
 
 
 DISCORD_URL = "https://discord.gg/rrcTR6pNnC"
@@ -59,6 +60,7 @@ class Application:
         self.last_keys = {0x75: False, 0x77: False}
         self.saved_counts = (self.engine.caught, self.engine.sold_batches)
         self.last_frame_metrics = {}
+        self.input_trace = []
         self.ui = MacroUI(root, {
             "toggle": self.toggle, "stop": self.stop, "refresh": self.windows,
             "select": self.select, "settings": self.settings,
@@ -188,6 +190,27 @@ class Application:
         if not webbrowser.open(DISCORD_URL, new=2):
             self.ui.update_status(self.snapshot("Open " + DISCORD_URL + " in your browser."))
 
+    def _trace_input(self, action, outcome, error=""):
+        """Keep a small local sale-input record; never capture or upload images."""
+        profile = getattr(self, "profile", None)
+        if profile is None:
+            return
+        events = getattr(self, "input_trace", [])
+        event = {"time": time.time(), "action": action.kind, "outcome": outcome,
+                 "phase": self.engine.phase, "caught": self.engine.caught}
+        if error:
+            event["error"] = error
+        events.append(event)
+        self.input_trace = events[-120:]
+        path = profile.root / "input-trace.json"
+        try:
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(json.dumps({"version": __version__, "events": self.input_trace},
+                                            indent=2), encoding="utf-8")
+            temporary.replace(path)
+        except OSError:
+            logging.exception("Could not save the local input trace")
+
     def _action(self, action, captured_at=None):
         if action.kind == "up":
             self.desktop.mouse_up()
@@ -215,7 +238,13 @@ class Application:
                 raise RuntimeError("Clicks that move the cursor are allowed only during a sale.")
             self.desktop.click(self.target, action.x, action.y, cancel=self.input_cancel)
         elif action.kind == "inventory":
-            self.desktop.key(self.target, VK_OEM_3, cancel=self.input_cancel)
+            self._trace_input(action, "requested")
+            try:
+                accepted = self.desktop.key(self.target, VK_OEM_3, cancel=self.input_cancel)
+            except Exception as error:
+                self._trace_input(action, "failed", str(error))
+                raise
+            self._trace_input(action, "accepted" if accepted else "cancelled")
 
     def work(self):
         try:

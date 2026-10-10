@@ -4,7 +4,7 @@ A small Windows desktop macro for SCROOMS. It reads the visible Roblox window an
 
 ## Download and use
 
-Download `ShroomsMacro-1.0.7.exe` from [Releases](https://github.com/kamasix/Scrooms-Macro/releases). Place it in a writable folder and run it; Python is not required for the EXE.
+Download `ShroomsMacro-1.0.8.exe` from [Releases](https://github.com/kamasix/Scrooms-Macro/releases). Place it in a writable folder and run it; Python is not required for the EXE.
 
 1. Open SCROOMS in Roblox, stand where you want to catch, and equip your instrument.
 2. Select the Roblox window in the macro. Refresh the list if necessary.
@@ -22,7 +22,8 @@ Use **Join Discord** at the bottom of the window or [join the community here](ht
 - Matches Frequency and follows the moving catch field: **hold left mouse to move right; release to move left**.
 - Keeps the physical cursor still during minigames. Selling is the only stage that moves it to a detected button.
 - After each detected catch by default, presses the backtick/tilde key, detects **Sell All**, clicks it twice using fresh button detections, then presses backtick/tilde again to close inventory. The catch interval is adjustable in Settings.
-- Moves smoothly to sale buttons, lets the hover position settle, then holds the click for up to 80 ms. Inventory keys use a 40 ms press. Stop interrupts movement, waits, and presses and releases owned inputs.
+- Waits 2.5 seconds after a detected catch for the result animation, then starts the sale. A persistent success label cannot block a sale that is due.
+- Moves smoothly to sale buttons, lets the hover position settle, then holds the click for up to 80 ms. Inventory uses a physical backtick key press held for up to 100 ms. Stop interrupts movement, waits, and presses and releases owned inputs.
 - Pauses if Roblox loses focus, a control cannot be detected, or a stage times out. It preserves the catch count if it cannot find the sell button.
 
 The sale counter records completed input sequences; it does not read the game's currency balance.
@@ -39,7 +40,9 @@ Ring status distinguishes a missing pointer or target from a frame that became t
 
 **Perfect correction** adjusts estimated input latency in milliseconds, starting at 8 ms. Increase it if clicks consistently land after the small Perfect segment. This only rejects clicks projected to arrive too late; it never permits clicking while the observed pointer is outside Perfect.
 
-If the sale has a separate confirmation button, calibrate **Sale confirmation**. The stock layout expects a second click on Sell All. The inventory key uses the Windows OEM backtick/tilde key; keyboard layouts or game bindings can differ.
+If the sale has a separate confirmation button, calibrate **Sale confirmation**. The stock layout expects a second click on Sell All. Inventory uses the physical backtick key (scan code `0x29`, normally below Escape), independent of the typed character. The game's inventory binding needs to use this key.
+
+If inventory does not open, `profiles/default/input-trace.json` records recent inventory requests and whether Windows accepted the press and release. An `accepted` entry confirms input dispatch, not the game's response. Status messages also distinguish waiting for Sell All after the key from waiting for confirmation after the first click. The trace remains local and contains no images or window identifiers.
 
 ## Run from source
 
@@ -69,7 +72,7 @@ Public checks use generated images and mocked Windows input. Original gameplay s
 
 ## Local data and privacy
 
-Settings, counts, and custom calibration crops are created under `profiles/` beside the program. Optional snapshots go into `diagnostics/`. There is no network upload or telemetry in the application. These folders, logs, screenshots, and build intermediates are excluded from source control. No original gameplay screenshots or personal profiles are included in this repository.
+Settings, counts, custom calibration crops, and the bounded inventory input trace are created under `profiles/` beside the program. Optional snapshots go into `diagnostics/`. There is no network upload or telemetry in the application. These folders, logs, screenshots, and build intermediates are excluded from source control. No original gameplay screenshots or personal profiles are included in this repository.
 
 ## License
 

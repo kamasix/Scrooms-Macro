@@ -290,18 +290,51 @@ class EngineChecks(unittest.TestCase):
         self.catch(.4, 1)
         self.assertEqual([a.kind for a in self.step(Observation(success=True), 2)], ["up"])
         self.assertEqual(self.engine.caught, 1)
-        self.assertEqual([a.kind for a in self.step(Observation(), 3.3)], ["up"])
-        opening = self.step(Observation(sell=button), 3.7)
+        # Leave 2.5 s for the catch result animation before requesting inventory.
+        self.assertEqual(self.step(Observation(), 3.3), [])
+        self.assertEqual([a.kind for a in self.step(Observation(), 4.6)], ["up"])
+        opening = self.step(Observation(sell=button), 5.0)
         self.assertEqual([a.kind for a in opening], ["inventory"])
-        self.assertEqual(self.step(Observation(), 4.4), [])
-        first = self.step(Observation(sell=button), 4.5)
+        self.assertEqual(self.step(Observation(), 5.7), [])
+        first = self.step(Observation(sell=button), 5.8)
         self.assertEqual([a.kind for a in first], ["click"])
-        self.assertEqual(self.step(Observation(), 5.2), [])
-        second = self.step(Observation(sell=button), 5.3)
+        self.assertEqual(self.step(Observation(), 6.5), [])
+        second = self.step(Observation(sell=button), 6.6)
         self.assertEqual([a.kind for a in second], ["click"])
-        self.assertEqual([a.kind for a in self.step(Observation(), 6.2)], ["inventory"])
+        self.assertEqual([a.kind for a in self.step(Observation(), 7.5)], ["inventory"])
         self.assertEqual(self.engine.caught, 0)
         self.assertEqual(self.engine.sold_batches, 1)
+
+    def test_pending_sale_is_not_blocked_by_a_persistent_catch_confirmation(self):
+        self.config["sell_every"] = 1
+        self.catch(.4, 1)
+        self.assertEqual([a.kind for a in self.step(Observation(success=True), 2)], ["up"])
+        self.assertEqual(self.step(Observation(success=True), 4.4), [])
+        self.assertEqual([a.kind for a in self.step(Observation(success=True), 4.6)], ["up"])
+        self.assertEqual(self.engine.phase, "sell_open")
+        self.assertEqual([a.kind for a in self.step(Observation(success=True), 5.0)], ["inventory"])
+        self.assertEqual(self.engine.phase, "sell_first")
+        self.assertEqual(self.engine.caught, 1)
+        self.assertEqual(self.engine.sold_batches, 0)
+
+    def test_catch_cooldown_still_waits_for_persistent_success_if_no_sale_is_due(self):
+        self.catch(.4, 1)
+        self.step(Observation(success=True), 2)
+        self.assertEqual(self.step(Observation(success=True), 5), [])
+        self.assertEqual(self.engine.phase, "cooldown")
+        self.assertEqual(self.engine.caught, 1)
+
+    def test_missing_sale_confirmation_reports_the_actual_blocked_step(self):
+        self.engine.caught = 10
+        button = Match(1420, 635, .99, (1380, 620, 80, 30))
+        self.step(Observation(), 1)
+        self.step(Observation(), 1.4)
+        self.step(Observation(sell=button), 2.1)
+        self.assertIn("confirmation", self.engine.status.lower())
+        self.step(Observation(), 10.2)
+        self.assertIn("after the first click", self.engine.error)
+        self.assertEqual(self.engine.caught, 10)
+        self.assertEqual(self.engine.sold_batches, 0)
 
     def test_sell_closes_inventory_once_even_if_confirmation_is_still_visible(self):
         self.config["separate_confirmation"] = True
@@ -332,6 +365,7 @@ class EngineChecks(unittest.TestCase):
         self.step(Observation(), 1.4)
         self.step(Observation(), 10)
         self.assertTrue(self.engine.error)
+        self.assertIn("after the inventory key", self.engine.error)
         self.assertEqual(self.engine.caught, 10)
 
 

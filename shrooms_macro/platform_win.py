@@ -205,10 +205,13 @@ def _mouse_input(flags: int, dx: int = 0, dy: int = 0) -> _INPUT:
     return item
 
 
-def _keyboard_input(vk: int, release: bool = False) -> _INPUT:
+def _keyboard_input(vk: int, release: bool = False,
+                    *, scan_code: int | None = None) -> _INPUT:
     item = _INPUT()
     item.type = 1
-    item.ki = _KEYBDINPUT(vk, 0, 0x0002 if release else 0, 0, 0)
+    flags = (0x0002 if release else 0) | (0x0008 if scan_code is not None else 0)
+    item.ki = _KEYBDINPUT(0 if scan_code is not None else vk,
+                         0 if scan_code is None else scan_code, flags, 0, 0)
     return item
 
 
@@ -226,6 +229,7 @@ class Desktop:
         self._left_held = False
         self._held_hwnd: int | None = None
         self._held_key: int | None = None
+        self._held_key_up_packet: _INPUT | None = None
         self._input_lock = threading.RLock()
 
     @staticmethod
@@ -552,18 +556,25 @@ class Desktop:
             if self._held_key is None:
                 return True
             try:
-                if self._send_raw([_keyboard_input(self._held_key, True)]) == 1:
+                packet = self._held_key_up_packet
+                if packet is None:
+                    packet = _keyboard_input(self._held_key, True)
+                if self._send_raw([packet]) == 1:
                     self._held_key = None
+                    self._held_key_up_packet = None
                     return True
             except Exception:
                 pass  # Preserve ownership so shutdown or the next attempt can retry.
             return False
 
-    def key(self, hwnd: int, vk: int, cancel: threading.Event | None = None) -> None:
-        """Press a foreground-only key for up to 40 ms, then always release it.
+    def key(self, hwnd: int, vk: int, cancel: threading.Event | None = None) -> bool:
+        """Press a foreground-only key, then release the exact accepted packet.
 
-        Separate down/up events give the game a rendered frame to observe the
-        press. The wait holds no input lock and cancellation releases it early.
+        Inventory uses physical grave scan 0x29 for up to 100 ms. Other virtual
+        keys keep their 40 ms press. Cancellation releases either one early.
+        Return False if cancellation prevents DOWN; return True once Windows
+        accepts DOWN and its matching UP, even if cancellation shortens the
+        hold. Rejected input or release raises InputUnavailable.
         """
         try:
             with self._input_lock:
@@ -576,20 +587,26 @@ class Desktop:
                 if not self.key_up():
                     raise InputUnavailable("Windows did not release the previous key press.")
                 if cancel is not None and cancel.is_set():
-                    return
+                    return False
                 self._guard(hwnd)
-                if self._send_raw([_keyboard_input(vk)]) != 1:
+                scan_code = 0x29 if vk == VK_OEM_3 else None
+                down = _keyboard_input(vk, scan_code=scan_code)
+                up = _keyboard_input(vk, True, scan_code=scan_code)
+                if self._send_raw([down]) != 1:
                     raise InputUnavailable("Windows did not accept the keyboard event.")
                 self._held_key = vk
+                self._held_key_up_packet = up
+                duration = 0.100 if vk == VK_OEM_3 else 0.040
             if cancel is not None:
-                cancel.wait(0.040)
+                cancel.wait(duration)
             else:
-                threading.Event().wait(0.040)
+                threading.Event().wait(duration)
         finally:
             self.mouse_up()
             released = self.key_up()
         if not released:
             raise InputUnavailable("Windows did not release the key press.")
+        return True
 
     def key_pressed(self, vk: int) -> bool:
         return bool(_user32.GetAsyncKeyState(vk) & 0x8000)

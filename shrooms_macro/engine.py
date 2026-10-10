@@ -131,8 +131,8 @@ class Engine:
         self.catch_started = None
         self.last_progress = None
         self.tuning_held = self.catch_held = False
-        self._enter("cooldown", now, 1.2)
-        self.status = "Caught! Preparing the next attempt"
+        self._enter("cooldown", now, 2.5)
+        self.status = "Caught! Waiting for the result animation"
         return [Action("up")]
 
     def step(self, obs, shape: tuple, now: float, captured_at: float | None = None) -> list[Action]:
@@ -149,14 +149,17 @@ class Engine:
 
         if self.phase.startswith("sell"):
             return self._sell_step(obs, now)
+        sale_due = self.caught >= int(self.config.get("sell_every", 1))
         if self.phase == "cooldown":
-            if now < self.deadline or obs.success:
+            # Keep the result-animation delay, but a persistent confirmation
+            # must not prevent the inventory key when a sale is already due.
+            if now < self.deadline or (obs.success and not sale_due):
                 return []
             self._enter("idle", now)
 
-        if self.caught >= int(self.config.get("sell_every", 1)):
+        if sale_due:
             self._enter("sell_open", now, 0.3)
-            self.status = "Opening inventory to sell"
+            self.status = "Opening inventory: key requested"
             return [Action("up")]
 
         if getattr(obs, "catch_present", False) and self.phase != "catch":
@@ -364,16 +367,23 @@ class Engine:
         if now < self.deadline:
             return []
         if now - self.phase_started > 8:
-            self.error = "Sell button not detected. Count preserved — check inventory."
+            blocked = {
+                "sell_open": "Inventory opening timed out before the key press.",
+                "sell_first": "Sell All not detected after the inventory key.",
+                "sell_confirm": "Sale confirmation not detected after the first click.",
+                "sell_finish": "Inventory closing timed out after confirmation.",
+            }.get(self.phase, "Sale sequence timed out.")
+            self.error = blocked + " Count preserved — check inventory."
             return [Action("up")]
         if self.phase == "sell_open":
             self._enter("sell_first", now, 0.6)
+            self.status = "Waiting for Sell All after inventory key"
             # A preopening template match cannot replace the explicit key
             # press. Read the Sell All button again after inventory opens.
             return [Action("inventory")]
         if self.phase == "sell_first" and obs.sell is not None:
             self._enter("sell_confirm", now, 0.65)
-            self.status = "Sell All — waiting for confirmation"
+            self.status = "Waiting for sale confirmation"
             return [Action("click", obs.sell.x, obs.sell.y)]
         if self.phase == "sell_confirm":
             # The user's UI confirms via the same Sell All button. If they supply
@@ -381,14 +391,14 @@ class Engine:
             match = obs.confirm if self.config.get("separate_confirmation", False) else (obs.confirm or obs.sell)
             if match is not None:
                 self._enter("sell_finish", now, 0.8)
-                self.status = "Confirming the sale"
+                self.status = "Sale confirmation clicked — preparing inventory close"
                 return [Action("click", match.x, match.y)]
         if self.phase == "sell_finish":
             # Counts describe completed input sequences; the game balance is never read.
             self.caught = 0
             self.sold_batches += 1
             self._enter("cooldown", now, 1.0)
-            self.status = "Confirmation sent — returning to catches"
+            self.status = "Inventory close key requested — returning to catches"
             # The requested cycle always ends with a second backtick press,
             # even when the button disappears immediately after confirmation.
             return [Action("inventory")]
