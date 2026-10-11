@@ -11,6 +11,7 @@ import queue
 import threading
 import time
 import webbrowser
+from collections import deque
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox
@@ -60,6 +61,7 @@ class Application:
         self.last_keys = {0x75: False, 0x77: False}
         self.saved_counts = (self.engine.caught, self.engine.sold_batches)
         self.last_frame_metrics = {}
+        self.frame_metrics_history = deque(maxlen=240)
         self.input_trace = []
         self.ui = MacroUI(root, {
             "toggle": self.toggle, "stop": self.stop, "refresh": self.windows,
@@ -155,6 +157,7 @@ class Application:
             with self.control_lock:
                 self.generation += 1
                 self.engine.start(time.perf_counter())
+                self._reset_frame_metrics()
                 self.input_cancel.clear()
                 self.active.set()
         except InputUnavailable as error:
@@ -247,6 +250,22 @@ class Application:
                 raise
             self._trace_input(action, "accepted" if accepted else "cancelled")
 
+    def _reset_frame_metrics(self):
+        """Keep frame timing and recognition history only for the current run."""
+        self.last_frame_metrics = {}
+        self.frame_metrics_history = deque(maxlen=240)
+
+    def _record_frame_metrics(self):
+        # Values are scalar: copies remain unchanged by the next frame or tap.
+        self.last_frame_metrics["phase"] = self.engine.phase
+        self.last_frame_metrics["status"] = self.engine.status
+        self.frame_metrics_history.append(dict(self.last_frame_metrics))
+
+    def _frame_metrics_snapshot(self):
+        with self.control_lock:
+            return (dict(self.last_frame_metrics),
+                    [dict(sample) for sample in self.frame_metrics_history])
+
     def work(self):
         try:
             while not self.shutdown.is_set():
@@ -278,16 +297,25 @@ class Application:
                             "ring_present": obs.ring_present,
                             "ring_recognized": obs.charge is not None,
                             "ring_diagnostic": obs.ring_diagnostic,
+                            "pointer_angle_rad": (obs.charge.marker if obs.charge is not None
+                                                  and obs.charge.axis == "angle" else None),
+                            "perfect_center_rad": (obs.charge.zone_angle if obs.charge is not None
+                                                   and obs.charge.axis == "angle" else None),
+                            "perfect_size_rad": (obs.charge.zone_size if obs.charge is not None
+                                                 and obs.charge.axis == "angle" else None),
                             "tap_called": False,
                         }
                         actions = self.engine.step(obs, frame.shape, decision_time,
                                                    captured_at=captured_at)
                         self.last_frame_metrics["tap_requested"] = any(action.kind == "tap" for action in actions)
                         self.last_frame_metrics["decision_status"] = self.engine.status
-                        for action in actions:
-                            if not self.active.is_set() or self.input_cancel.is_set():
-                                break
-                            self._action(action, captured_at=captured_at)
+                        try:
+                            for action in actions:
+                                if not self.active.is_set() or self.input_cancel.is_set():
+                                    break
+                                self._action(action, captured_at=captured_at)
+                        finally:
+                            self._record_frame_metrics()
                         if self.engine.error:
                             self.active.clear()
                             self._release_inputs()
@@ -444,8 +472,7 @@ class Application:
             stamp = time.strftime("%Y%m%d-%H%M%S")
             with self.detector_lock:
                 obs = self.detector.analyze(frame, time.perf_counter())
-            with self.control_lock:
-                metrics = dict(self.last_frame_metrics)
+            metrics, history = self._frame_metrics_snapshot()
             save_image(folder / (stamp + "-screen.png"), frame)
             save_image(folder / (stamp + "-detection.png"), self.detector.annotate(frame, obs))
             (folder / (stamp + ".json")).write_text(json.dumps({
@@ -453,6 +480,7 @@ class Application:
                 "missing": self.detector.ready(), "phase": self.engine.phase,
                 "observation": str(obs),
                 "last_worker_frame": metrics,
+                "recent_worker_frames": history,
             }, ensure_ascii=False, indent=2), encoding="utf-8")
             self.ui.update_status(self.snapshot("Local snapshots saved in the diagnostics folder."))
         self.capture_after_countdown(save, "image diagnostics")

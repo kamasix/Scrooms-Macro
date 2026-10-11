@@ -1,6 +1,10 @@
 @echo off
 setlocal
 cd /d "%~dp0"
+if exist "ShroomsMacro-1.0.10.exe" (
+    start "" "%~dp0ShroomsMacro-1.0.10.exe"
+    exit /b
+)
 if exist "ShroomsMacro-1.0.9.exe" (
     start "" "%~dp0ShroomsMacro-1.0.9.exe"
     exit /b

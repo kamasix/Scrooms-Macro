@@ -154,8 +154,39 @@ class EngineChecks(unittest.TestCase):
         for now in (1.8, 2.8, 4, 7):
             self.assertEqual([a.kind for a in self.step(Observation(), now)], ["up"])
             self.assertEqual(self.engine.phase, "charge")
-        self.step(Observation(), 12)
-        self.assertTrue(self.engine.error)
+        self.assertEqual([a.kind for a in self.step(Observation(), 12)], ["up"])
+        self.assertEqual(self.engine.error, "")
+        self.assertEqual(self.engine.phase, "charge")
+        self.assertIn("rechecking", self.engine.status)
+
+    def test_missing_perfect_can_recover_after_the_old_timeout(self):
+        missing = Observation(ring_present=True, ring_diagnostic="White pointer not detected")
+        for now in (1, 12, 30):
+            self.assertEqual([a.kind for a in self.step(missing, now)], ["up"])
+            self.assertEqual(self.engine.error, "")
+        self.assertIn("White pointer not detected", self.engine.status)
+        fresh = BarTrack((100, 100, 180, 180), 1, .95, 1.05, "angle", .99)
+        self.assertEqual([a.kind for a in self.step(Observation(charge=fresh), 30.01)], ["tap"])
+        self.assertEqual(self.engine.phase, "transition")
+
+    def test_recognized_grey_keeps_tracking_after_the_old_timeout(self):
+        grey = BarTrack((100, 100, 180, 180), .5, .95, 1.05, "angle", .99)
+        for now in (1, 12, 30):
+            self.assertEqual([a.kind for a in self.step(Observation(charge=grey), now)], ["up"])
+            self.assertEqual(self.engine.phase, "charge")
+            self.assertEqual(self.engine.error, "")
+        fresh = BarTrack(grey.region, 1, .95, 1.05, "angle", .99)
+        self.assertEqual([a.kind for a in self.step(Observation(charge=fresh), 31)], ["tap"])
+
+    def test_rechecking_still_rejects_stale_perfect_frames(self):
+        self.step(Observation(ring_present=True), 1)
+        self.step(Observation(), 20)
+        green = BarTrack((100, 100, 180, 180), 1, .95, 1.05, "angle", .99)
+        actions = self.engine.step(Observation(charge=green), (1080, 1920, 3),
+                                   30.3, captured_at=30)
+        self.assertEqual([a.kind for a in actions], ["up"])
+        self.assertEqual(self.engine.phase, "charge")
+        self.assertEqual(self.engine.error, "")
 
     def test_initial_instrument_press_is_once_and_waits_for_ui(self):
         self.assertEqual([a.kind for a in self.step(Observation(), 1)], ["down"])

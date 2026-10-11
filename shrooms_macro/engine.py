@@ -471,9 +471,9 @@ class Engine:
                 self.charge_speeds.clear()
                 self.status = "White pointer on Perfect — clicking"
                 return [Action("up" if self.config.get("charge_action", "click") == "release" else "tap")]
-            if now - self.phase_started > 10:
-                self.error = "Perfect timed out — check the ring in Preview."
-                return [Action("up")]
+            # A missed revolution is not permission to stop observing or to
+            # start another instrument press. Keep the same fresh-overlap
+            # guards active until a later frame can authorize the click.
             return [Action("down" if self.config.get("charge_action", "click") == "release" else "up")]
 
         if self.phase == "transition":
@@ -494,9 +494,10 @@ class Engine:
                 return []
             self.cast_pending = False
             detail = getattr(obs, "ring_diagnostic", "")
-            self.status = ("Ring: " + detail) if detail else "Ring: looking for the pointer and green segment"
             if now - self.phase_started > 10:
-                self.error = "Perfect not detected — check the ring in Preview."
+                self.status = "Ring: rechecking — " + (detail or "waiting for the pointer and Perfect")
+            else:
+                self.status = ("Ring: " + detail) if detail else "Ring: looking for the pointer and green segment"
             # Losing the target must never become a fresh cast/click.
             return [Action("up")]
         if self.phase == "tuning":

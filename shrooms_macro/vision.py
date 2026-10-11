@@ -618,6 +618,55 @@ class Detector:
          self._last_ring_present, self._last_ring_diagnostic, self._ring_used_cached_geometry) = found_state or saved
         return found
 
+    @staticmethod
+    def _flanking_green_zone(greens: np.ndarray, distance: np.ndarray, angles: np.ndarray,
+                             radius: float, marker: float, marker_low: float,
+                             marker_high: float) -> tuple[float, float] | None:
+        """Join current green remnants only when the verified pointer splits them.
+
+        Tiny Perfect sectors can be mostly covered on the very first frame.
+        Two measured flanks determine the arc; a hidden or one-sided target
+        supplies no such evidence and must not be inferred.
+        """
+        marker_left = (marker_low - marker + math.pi) % TAU - math.pi
+        marker_right = (marker_high - marker + math.pi) % TAU - math.pi
+        fragments = []
+        # Antialiasing can separate a flank into adjacent pixel islands.
+        # Dilation groups those islands, but all counts/angles/radii below
+        # still come exclusively from the original measured green pixels.
+        kernel = min(9, max(3, math.ceil(radius * 0.035) | 1))
+        groups = cv2.dilate(greens.astype(np.uint8) * 255,
+                            np.ones((kernel, kernel), dtype=np.uint8))
+        for box, _, _, _ in _components(groups, 2):
+            x, y, w, h = box
+            mask = greens[y:y + h, x:x + w]
+            area = np.count_nonzero(mask)
+            if area < 2:
+                continue
+            relative = (angles[y:y + h, x:x + w][mask] - marker + math.pi) % TAU - math.pi
+            low, high = np.quantile(relative, (0.03, 0.97))
+            radial_low, radial_high = np.quantile(distance[y:y + h, x:x + w][mask], (0.05, 0.95))
+            if high - low <= 0.30 and radial_high - radial_low >= radius * 0.03:
+                fragments.append((area, float(low), float(high), float(radial_low), float(radial_high)))
+        best = None
+        for left in fragments:
+            if not left[2] <= marker_left + 0.04 or left[1] >= marker_left:
+                continue
+            for right in fragments:
+                if not right[1] >= marker_right - 0.04 or right[2] <= marker_right:
+                    continue
+                gap = right[1] - left[2]
+                span = right[2] - left[1]
+                area = left[0] + right[0]
+                if (area >= max(6, round(radius * 0.12))
+                        and 0 < gap <= marker_right - marker_left + 0.08
+                        and left[2] >= marker_left - 0.04 and right[1] <= marker_right + 0.04
+                        and min(left[4], right[4]) - max(left[3], right[3]) >= max(1.0, radius * 0.015)
+                        and 0.015 <= span <= 0.65 and left[1] < 0 < right[2]
+                        and (best is None or area > best[0])):
+                    best = (area, (marker + left[1]) % TAU, (marker + right[2]) % TAU)
+        return (best[1], best[2]) if best is not None else None
+
     def _ring(self, crop: np.ndarray, region: Box, now: float | None = None) -> BarTrack | None:
         now = time.monotonic() if now is None else now
         self._last_ring_diagnostic = ""
@@ -638,8 +687,7 @@ class Detector:
         cached = self._ring_zone
         recent_zone = cached is not None and cached[0] == region and 0 <= now - cached[3] <= 0.25
         green_count = np.count_nonzero(green)
-        if green_count < max(8, w * h * 0.001) and not recent_zone:
-            return unavailable("Perfect target not detected")
+        enough_green = green_count >= max(8, w * h * 0.001)
         _, cx, cy, radius = self._ring_geometry
         yy, xx = np.indices((h, w), dtype=np.float32)
         distance = np.hypot(xx - cx, yy - cy)
@@ -647,7 +695,7 @@ class Detector:
         greens = (green > 0) & annulus
         components = _components(greens.astype(np.uint8) * 255, max(6, round(radius * 0.08)))
         observed_zone = None
-        if components:
+        if components and (enough_green or recent_zone):
             zone = max(components, key=lambda item: item[1])
             zx, zy, zw, zh = zone[0]
             zone_mask = np.zeros((h, w), dtype=bool)
@@ -656,8 +704,6 @@ class Detector:
             low, high, _ = _circular_interval(angles)
             if 0.015 <= (high - low) % TAU <= 0.65:
                 observed_zone = (low, high)
-        if observed_zone is None and not recent_zone:
-            return unavailable("Perfect target not detected on the ring")
         marker_color = self.config.get("charge_marker_color", (245, 245, 245))
         try:
             sample = np.asarray(marker_color, dtype=float)
@@ -696,6 +742,30 @@ class Detector:
         if dark_fraction < 0.35:
             return unavailable("Dark ring interior not verified")
         _, marker, marker_width, marker_low, marker_high = max(candidates)
+        split_zone = None
+        # A complete independent target elsewhere on the circle, or a broad
+        # green component, cannot be replaced by near-pointer fragments.
+        if observed_zone is not None:
+            observed_size = (observed_zone[1] - observed_zone[0]) % TAU
+            observed_center = (observed_zone[0] + observed_size / 2) % TAU
+            target_near_pointer = abs((marker - observed_center + math.pi) % TAU - math.pi) <= (observed_size + marker_width) / 2 + 0.04
+        else:
+            target_near_pointer = not (enough_green and components)
+        if target_near_pointer:
+            split_zone = self._flanking_green_zone(greens, distance, np.arctan2(yy - cy, xx - cx),
+                                                   radius, marker, marker_low, marker_high)
+        if split_zone is not None and observed_zone is not None:
+            split_size = (split_zone[1] - split_zone[0]) % TAU
+            split_center = (split_zone[0] + split_size / 2) % TAU
+            center_shift = abs((observed_center - split_center + math.pi) % TAU - math.pi)
+            if center_shift + observed_size / 2 > split_size / 2 + 0.02:
+                # It must extend the very same measured fragment, rather
+                # than replace another nearby independently visible target.
+                split_zone = None
+        if split_zone is not None:
+            observed_zone = split_zone
+        if observed_zone is None and not recent_zone:
+            return unavailable("Perfect target not detected on the ring" if enough_green else "Perfect target not detected")
         if recent_zone:
             old_low, old_high = cached[1], cached[2]
             old_size = (old_high - old_low) % TAU

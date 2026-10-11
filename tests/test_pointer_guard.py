@@ -3,6 +3,7 @@
 import sys
 import threading
 import unittest
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -672,6 +673,116 @@ class InputCleanupControllerTests(unittest.TestCase):
         self.app.desktop.mouse_up.assert_called_once()
         self.app.desktop.key_up.assert_called_once()
         self.warning_log.assert_not_called()
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows backend")
+class FrameMetricsControllerTests(unittest.TestCase):
+    def setUp(self):
+        from shrooms_macro.app import Application
+
+        self.app = Application.__new__(Application)
+        self.app.root = MagicMock()
+        self.app.ui = MagicMock()
+        self.app.desktop = MagicMock()
+        self.app.desktop.key_up.return_value = True
+        self.app.desktop.is_foreground.return_value = True
+        self.app.desktop.cursor_over.return_value = True
+        self.app.target = 101
+        self.app.target_label = "Mock game"
+        self.app.profile = SimpleNamespace(data={"auto_sell": True})
+        self.app.pending_start = None
+        self.app.generation = 4
+        self.app.calibrating = False
+        self.app.shutdown = threading.Event()
+        self.app.active = threading.Event()
+        self.app.active.set()
+        self.app.input_cancel = threading.Event()
+        self.app.control_lock = threading.RLock()
+        self.app.detector_lock = threading.RLock()
+        self.app.input_release_warning = ""
+        self.app.engine = SimpleNamespace(
+            phase="transition", status="Perfect", caught=0, sold_batches=0,
+            error="", pause=MagicMock(), start=MagicMock(), step=MagicMock())
+        self.app.detector = MagicMock()
+        self.app.post = MagicMock()
+        self.app._reset_frame_metrics()
+
+    def test_history_is_bounded_and_copies_metrics_at_record_time(self):
+        for frame in range(250):
+            self.app.last_frame_metrics = {"capture_ms": frame, "tap_called": False}
+            self.app._record_frame_metrics()
+        self.assertIsInstance(self.app.frame_metrics_history, deque)
+        self.assertEqual(self.app.frame_metrics_history.maxlen, 240)
+        self.assertEqual(len(self.app.frame_metrics_history), 240)
+        self.assertEqual(self.app.frame_metrics_history[0]["capture_ms"], 10)
+        self.app.last_frame_metrics["tap_called"] = True
+        self.assertFalse(self.app.frame_metrics_history[-1]["tap_called"])
+
+    def test_diagnostics_snapshot_does_not_expose_mutable_history(self):
+        self.app.last_frame_metrics = {"capture_ms": 4.2, "tap_called": False}
+        self.app._record_frame_metrics()
+        last, recent = self.app._frame_metrics_snapshot()
+        last["capture_ms"] = 100
+        recent[0]["tap_called"] = True
+        recent.append({"extra": True})
+        self.assertEqual(self.app.last_frame_metrics["capture_ms"], 4.2)
+        self.assertFalse(self.app.frame_metrics_history[0]["tap_called"])
+        self.assertEqual(len(self.app.frame_metrics_history), 1)
+
+    def test_successful_new_run_clears_previous_frame_history(self):
+        self.app.last_frame_metrics = {"tap_called": True}
+        self.app._record_frame_metrics()
+        self.app.finish_start()
+        self.assertEqual(self.app.last_frame_metrics, {})
+        self.assertEqual(len(self.app.frame_metrics_history), 0)
+        self.assertTrue(self.app.active.is_set())
+        self.app.engine.start.assert_called_once()
+
+    def _run_one_mocked_frame(self, dispatch_at):
+        from shrooms_macro.engine import Action
+        from shrooms_macro.vision import BarTrack, Observation
+
+        ring = BarTrack((400, 300, 200, 200), 1.24, 1.2, 1.28, "angle", .95)
+        self.app.detector.analyze.return_value = Observation(
+            charge=ring, ring_present=True, ring_diagnostic="Perfect and pointer recognized")
+        self.app.desktop.capture.return_value = SimpleNamespace(shape=(1080, 1920, 3))
+        self.app.engine.step.return_value = [Action("tap")]
+        self.app.shutdown.wait = MagicMock(side_effect=lambda _delay: self.app.shutdown.set())
+        with patch("shrooms_macro.app.time.perf_counter",
+                   side_effect=[0, .001, .003, .004, .005, .006, dispatch_at, .055]):
+            self.app.work()
+        self.assertEqual(len(self.app.frame_metrics_history), 1)
+        return self.app.frame_metrics_history[0]
+
+    def test_worker_records_recognition_and_tap_after_dispatch_without_identifiers(self):
+        sample = self._run_one_mocked_frame(.007)
+        self.assertTrue(sample["tap_requested"])
+        self.assertTrue(sample["tap_called"])
+        self.assertAlmostEqual(sample["pointer_angle_rad"], 1.24)
+        self.assertAlmostEqual(sample["perfect_center_rad"], 1.24)
+        self.assertAlmostEqual(sample["perfect_size_rad"], .08)
+        self.assertEqual(sample["capture_ms"], 2)
+        self.assertEqual(sample["analysis_ms"], 1)
+        self.assertEqual(sample["decision_age_ms"], 4)
+        self.assertEqual(sample["dispatch_age_ms"], 5)
+        self.assertEqual(sample["phase"], "transition")
+        self.assertEqual(sample["status"], "Perfect")
+        self.assertEqual(set(sample), {
+            "capture_ms", "analysis_ms", "decision_age_ms", "dispatch_age_ms",
+            "ring_present", "ring_recognized", "ring_diagnostic", "pointer_angle_rad",
+            "perfect_center_rad", "perfect_size_rad", "tap_called", "tap_requested",
+            "decision_status", "phase", "status",
+        })
+        self.app.desktop.tap.assert_called_once_with(101, cancel=self.app.input_cancel)
+
+    def test_worker_records_rejected_stale_tap_and_final_charge_status(self):
+        sample = self._run_one_mocked_frame(.050)
+        self.assertTrue(sample["tap_requested"])
+        self.assertFalse(sample["tap_called"])
+        self.assertEqual(sample["dispatch_age_ms"], 48)
+        self.assertEqual(sample["phase"], "charge")
+        self.assertIn("frame too old", sample["status"])
+        self.app.desktop.tap.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -72,6 +72,73 @@ class SyntheticRingTests(unittest.TestCase):
                 actions = engine.step(observation, frame.shape, 1.004, captured_at=1)
                 self.assertEqual([action.kind for action in actions], [expected])
 
+    def test_cold_split_perfect_flanks_are_joined_locally_and_after_far_recovery(self):
+        for center in ((1074.0, 555.0), (1740.0, 170.0)):
+            for height in (540, 720, 1080, 1440, 2160):
+                for angle in (0.0, math.tau - 0.02):
+                    with self.subTest(center=center, height=height, angle=angle):
+                        # No previously cached target: the white pointer
+                        # splits a measured green arc, including across zero.
+                        frame = ring_frame(angle, angle, height=height, center=center)
+                        observed = Detector(self.config.copy(), ROOT / "assets").analyze(frame, 1)
+                        self.assertIsNotNone(observed.charge)
+                        self.assertTrue(observed.charge.marker_overlap)
+                        self.assertTrue(observed.charge.zone_observed)
+                        self.assertTrue(0.10 < observed.charge.zone_size < 0.22)
+                        engine = Engine(self.config.copy())
+                        engine.start(0)
+                        self.assertEqual([action.kind for action in engine.step(observed, frame.shape, 1.004, captured_at=1)], ["tap"])
+
+    def test_cold_occlusion_does_not_invent_hidden_or_one_sided_targets(self):
+        for mode in ("hidden", "one_sided", "unrelated", "radial_mismatch", "ambiguous_pointer"):
+            for center in ((1074.0, 555.0), (1740.0, 170.0)):
+                for height in (540, 1080, 2160):
+                    with self.subTest(mode=mode, center=center, height=height):
+                        frame = ring_frame(0.0, center=center)
+                        cx, cy = center
+                        yy, xx = np.indices(frame.shape[:2])
+                        angle = np.arctan2(yy - cy, xx - cx)
+                        distance = np.hypot(xx - cx, yy - cy)
+                        annulus = (distance >= 93 * 0.73) & (distance <= 93)
+                        green = (frame[:, :, 1] == 255) & (frame[:, :, 0] == 0) & (frame[:, :, 2] == 0)
+                        if mode == "hidden":
+                            frame[green] = (0, 240, 180)
+                        elif mode == "one_sided":
+                            frame[green & (angle < 0.055)] = (0, 240, 180)
+                        elif mode == "unrelated":
+                            frame[green] = (8, 25, 8)
+                            for offset in (-0.20, 0.20):
+                                frame[annulus & (np.abs(angle - offset) < 0.02)] = (0, 255, 0)
+                        elif mode == "radial_mismatch":
+                            frame[green] = (8, 25, 8)
+                            frame[(distance >= 93 * 0.75) & (distance <= 93 * 0.82)
+                                  & (np.abs(angle + 0.07) < 0.014)] = (0, 255, 0)
+                            frame[(distance >= 93 * 0.92) & (distance <= 93)
+                                  & (np.abs(angle - 0.07) < 0.014)] = (0, 255, 0)
+                        else:
+                            frame[annulus & (distance >= 93 * 0.81)
+                                  & (np.abs(np.abs(angle) - math.pi) <= 0.052)] = (255, 255, 255)
+                        if height != 1080:
+                            frame = cv2.resize(frame, (round(1920 * height / 1080), height))
+                        observed = Detector(self.config.copy(), ROOT / "assets").analyze(frame, 1)
+                        if mode in ("hidden", "ambiguous_pointer"):
+                            self.assertIsNone(observed.charge)
+                        elif observed.charge is not None:
+                            self.assertFalse(observed.charge.marker_overlap)
+
+    def test_near_pointer_flanks_do_not_replace_an_independent_perfect_target(self):
+        frame = ring_frame(0.0, math.pi)
+        yy, xx = np.indices(frame.shape[:2])
+        angle = np.arctan2(yy - 555, xx - 1074)
+        distance = np.hypot(xx - 1074, yy - 555)
+        annulus = (distance >= 93 * 0.75) & (distance <= 93)
+        for offset in (-0.07, 0.07):
+            frame[annulus & (np.abs(angle - offset) < 0.012)] = (0, 255, 0)
+        observed = Detector(self.config.copy(), ROOT / "assets").analyze(frame, 1)
+        self.assertIsNotNone(observed.charge)
+        self.assertFalse(observed.charge.marker_overlap)
+        self.assertAlmostEqual(observed.charge.zone_angle, math.pi, delta=0.04)
+
     def test_missing_markers_keep_ring_present_without_blind_click(self):
         for pointer, target in ((True, False), (False, True), (False, False)):
             with self.subTest(pointer=pointer, target=target):
