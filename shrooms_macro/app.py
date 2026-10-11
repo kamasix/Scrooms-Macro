@@ -7,6 +7,7 @@ from .platform_win import Desktop, InputUnavailable, VK_OEM_3, DPI_AWARENESS
 
 import json
 import logging
+import math
 import queue
 import threading
 import time
@@ -62,6 +63,7 @@ class Application:
         self.saved_counts = (self.engine.caught, self.engine.sold_batches)
         self.last_frame_metrics = {}
         self.frame_metrics_history = deque(maxlen=240)
+        self.last_full_frame_shape = None
         self.input_trace = []
         self.ui = MacroUI(root, {
             "toggle": self.toggle, "stop": self.stop, "refresh": self.windows,
@@ -225,8 +227,39 @@ class Application:
         elif action.kind == "tap":
             if self.engine.phase not in ("charge", "transition"):
                 raise RuntimeError("Stationary clicks are allowed only during Perfect.")
-            dispatch_age = None if captured_at is None else time.perf_counter() - captured_at
+            if captured_at is not None and not math.isfinite(captured_at):
+                raise RuntimeError("Invalid Perfect capture timestamp.")
             metrics = getattr(self, "last_frame_metrics", None)
+            not_before = getattr(action, "not_before", None)
+            execute_at = getattr(action, "execute_at", None)
+            expires_at = getattr(action, "expires_at", None)
+            dispatch_time = time.perf_counter()
+            if any(value is not None for value in (not_before, execute_at, expires_at)):
+                if (not_before is None or execute_at is None or expires_at is None
+                        or captured_at is None or not math.isfinite(captured_at)
+                        or not all(math.isfinite(value) for value in (not_before, execute_at, expires_at))
+                        or not not_before <= execute_at <= expires_at):
+                    raise RuntimeError("Invalid Perfect click window.")
+                wait = execute_at - dispatch_time
+                if wait > 0.030:
+                    raise RuntimeError("Perfect click was scheduled too far ahead.")
+                generation, target = getattr(self, "generation", None), self.target
+                if metrics is not None:
+                    metrics["scheduled_wait_ms"] = round(max(0.0, wait) * 1000, 2)
+                if self.input_cancel.is_set() or (wait > 0 and self.input_cancel.wait(wait)):
+                    return
+                dispatch_time = time.perf_counter()
+                if (self.input_cancel.is_set() or self.target != target
+                        or getattr(self, "generation", None) != generation
+                        or (hasattr(self, "active") and not self.active.is_set())):
+                    return
+                if not not_before <= dispatch_time <= expires_at:
+                    self.engine.phase = "charge"
+                    self.engine.status = "Ring: Perfect click window passed — reading again"
+                    if metrics is not None:
+                        metrics["tap_called"] = False
+                    return
+            dispatch_age = None if captured_at is None else dispatch_time - captured_at
             if metrics is not None:
                 metrics["dispatch_age_ms"] = None if dispatch_age is None else round(dispatch_age * 1000, 2)
                 metrics["tap_called"] = False
@@ -236,7 +269,18 @@ class Application:
                 return
             if metrics is not None:
                 metrics["tap_called"] = True
-            self.desktop.tap(self.target, cancel=self.input_cancel)
+            input_deadline = expires_at
+            if captured_at is not None:
+                freshness_deadline = captured_at + 0.025
+                input_deadline = (freshness_deadline if input_deadline is None
+                                  else min(input_deadline, freshness_deadline))
+            accepted = (self.desktop.tap(self.target, cancel=self.input_cancel, deadline=input_deadline)
+                        if input_deadline is not None else self.desktop.tap(self.target, cancel=self.input_cancel))
+            if metrics is not None:
+                metrics["tap_accepted"] = accepted is True
+            if accepted is False:
+                self.engine.phase = "charge"
+                self.engine.status = "Ring: click window expired before input — reading again"
         elif action.kind == "click":
             if not self.engine.phase.startswith("sell"):
                 raise RuntimeError("Clicks that move the cursor are allowed only during a sale.")
@@ -254,6 +298,7 @@ class Application:
         """Keep frame timing and recognition history only for the current run."""
         self.last_frame_metrics = {}
         self.frame_metrics_history = deque(maxlen=240)
+        self.last_full_frame_shape = None
 
     def _record_frame_metrics(self):
         # Values are scalar: copies remain unchanged by the next frame or tap.
@@ -274,26 +319,59 @@ class Application:
                 began = time.perf_counter()
                 with self.control_lock:
                     generation, target, detector = self.generation, self.target, self.detector
+                    full_shape = getattr(self, "last_full_frame_shape", None)
+                    tracking_ring = self.engine.phase == "charge"
+                region = None
                 try:
                     if not self.desktop.is_foreground(target):
                         raise InputUnavailable("Paused: return to Roblox and press F6")
+                    if tracking_ring and full_shape is not None:
+                        with self.detector_lock:
+                            region = detector.charge_capture_region(full_shape)
+                    roi_fallback_ms = 0.0
                     capture_started = time.perf_counter()
-                    frame = self.desktop.capture(target)
+                    frame = (self.desktop.capture_region(target, full_shape, region)
+                             if region is not None else self.desktop.capture(target))
+                    if frame is None:
+                        roi_fallback_ms = (time.perf_counter() - capture_started) * 1000
+                        region = None
+                        capture_started = time.perf_counter()
+                        frame = self.desktop.capture(target)
                     capture_finished = time.perf_counter()
                     captured_at = (capture_started + capture_finished) * 0.5
                     analysis_started = time.perf_counter()
                     with self.detector_lock:
-                        obs = detector.analyze(frame, captured_at)
+                        obs = (detector.analyze_charge(frame, region, captured_at)
+                               if region is not None else detector.analyze(frame, captured_at))
                     analysis_finished = time.perf_counter()
+                    if region is not None and obs.charge is None:
+                        # A hidden/moved ring or the next minigame requires
+                        # the complete client again in this same iteration.
+                        roi_fallback_ms = (analysis_finished - capture_started) * 1000
+                        region = None
+                        capture_started = time.perf_counter()
+                        frame = self.desktop.capture(target)
+                        capture_finished = time.perf_counter()
+                        captured_at = (capture_started + capture_finished) * 0.5
+                        analysis_started = time.perf_counter()
+                        with self.detector_lock:
+                            obs = detector.analyze(frame, captured_at)
+                        analysis_finished = time.perf_counter()
+                    observation_shape = full_shape if region is not None else frame.shape
                     with self.control_lock:
                         if (not self.active.is_set() or generation != self.generation
                                 or self.input_cancel.is_set()):
                             continue
+                        if region is None:
+                            self.last_full_frame_shape = frame.shape
                         decision_time = time.perf_counter()
                         self.last_frame_metrics = {
                             "capture_ms": round((capture_finished - capture_started) * 1000, 2),
                             "analysis_ms": round((analysis_finished - analysis_started) * 1000, 2),
                             "decision_age_ms": round((decision_time - captured_at) * 1000, 2),
+                            "capture_mode": "ring" if region is not None else "full",
+                            "capture_pixels": frame.shape[0] * frame.shape[1],
+                            "roi_fallback_ms": round(roi_fallback_ms, 2),
                             "ring_present": obs.ring_present,
                             "ring_recognized": obs.charge is not None,
                             "ring_diagnostic": obs.ring_diagnostic,
@@ -305,7 +383,7 @@ class Application:
                                                  and obs.charge.axis == "angle" else None),
                             "tap_called": False,
                         }
-                        actions = self.engine.step(obs, frame.shape, decision_time,
+                        actions = self.engine.step(obs, observation_shape, decision_time,
                                                    captured_at=captured_at)
                         self.last_frame_metrics["tap_requested"] = any(action.kind == "tap" for action in actions)
                         self.last_frame_metrics["decision_status"] = self.engine.status
@@ -339,7 +417,10 @@ class Application:
                         warning = str(error) + (" · " + release_warning if release_warning else "")
                         self.post(self.snapshot(warning))
                 # Bounded, interruptible timing; no busy waiting or long input sequences.
-                interval = 1 / 120 if self.engine.phase in ("charge", "transition") else 1 / 60
+                if self.engine.phase == "charge" and region is not None:
+                    interval = 1 / 240
+                else:
+                    interval = 1 / 120 if self.engine.phase in ("charge", "transition") else 1 / 60
                 self.shutdown.wait(max(0, interval - (time.perf_counter() - began)))
         finally:
             self._release_inputs()

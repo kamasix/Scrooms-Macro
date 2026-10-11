@@ -209,6 +209,7 @@ class Detector:
         self._ring_zone: tuple[Box, float, float, float] | None = None
         self._last_ring_present = False
         self._last_ring_diagnostic = ""
+        self._capture_frame_shape: tuple[int, int] | None = None
         self._ring_used_cached_geometry = False
         self._last_geometry_retry = -math.inf
         self._ring_recovered_region: tuple[tuple[int, int], Box, Box] | None = None
@@ -1017,10 +1018,63 @@ class Detector:
                            x + cursor[0], right - left, x + cursor[0], progress,
                            left, right, y + bar_top, y + bar_bottom, y + cursor[1])
 
+    def charge_capture_region(self, full_shape: tuple[int, ...]) -> Box | None:
+        """Return only an already verified ring crop in full-client coordinates."""
+        if (self.config.get("charge_shape", "ring") != "ring"
+                or not self._last_ring_present or self._ring_geometry is None):
+            return None
+        try:
+            dimensions = tuple(int(value) for value in full_shape[:2])
+            if len(dimensions) != 2 or dimensions != self._capture_frame_shape:
+                return None
+            height, width = dimensions
+            region, cx, cy, radius = self._ring_geometry
+            x, y, crop_width, crop_height = region
+            if (min(width, height, crop_width, crop_height) <= 0
+                    or min(x, y) < 0 or x + crop_width > width or y + crop_height > height
+                    or not all(math.isfinite(value) for value in (cx, cy, radius))
+                    or radius <= 0):
+                return None
+            # The normal full-frame path recovers clipped calibration crops.
+            # Stay on that path until the entire pointer circumference fits.
+            if (cx - radius * 1.03 < 0 or cy - radius * 1.03 < 0
+                    or cx + radius * 1.03 >= crop_width
+                    or cy + radius * 1.03 >= crop_height):
+                return None
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return region
+
+    def analyze_charge(self, crop: np.ndarray, region: Box, now: float) -> Observation:
+        """Observe a verified small capture while retaining client coordinates.
+
+        This path intentionally cannot recognize other minigames. Its caller
+        reacquires the full client immediately whenever the ring is unavailable.
+        """
+        if (self.config.get("charge_shape", "ring") != "ring"
+                or self._ring_geometry is None or self._ring_geometry[0] != region
+                or not isinstance(crop, np.ndarray) or crop.ndim != 3
+                or crop.shape[2] < 3 or crop.size == 0):
+            return Observation()
+        try:
+            if len(region) != 4 or crop.shape[:2] != (region[3], region[2]):
+                return Observation()
+        except (TypeError, IndexError):
+            return Observation()
+        crop = crop[:, :, :3]
+        if crop.dtype != np.uint8:
+            crop = np.clip(crop, 0, 255).astype(np.uint8)
+        self._last_ring_present = False
+        self._last_ring_diagnostic = ""
+        charge = self._ring(crop, region, now)
+        return Observation(charge=charge, ring_present=self._last_ring_present,
+                           ring_diagnostic=self._last_ring_diagnostic)
+
     def analyze(self, frame: np.ndarray, now: float) -> Observation:
         if not isinstance(frame, np.ndarray) or frame.ndim != 3 or frame.shape[2] < 3 or frame.size == 0:
             return Observation()
         frame = frame[:, :, :3]
+        self._capture_frame_shape = frame.shape[:2]
         if frame.dtype != np.uint8:
             frame = np.clip(frame, 0, 255).astype(np.uint8)
         self._refresh_templates()

@@ -4,7 +4,7 @@ A small Windows desktop macro for SCROOMS. It reads the visible Roblox window an
 
 ## Download and use
 
-Download `ShroomsMacro-1.0.10.exe` from [Releases](https://github.com/kamasix/Scrooms-Macro/releases). Place it in a writable folder and run it; Python is not required for the EXE.
+Download `ShroomsMacro-1.0.11.exe` from [Releases](https://github.com/kamasix/Scrooms-Macro/releases). Place it in a writable folder and run it; Python is not required for the EXE.
 
 1. Open SCROOMS in Roblox, stand where you want to catch, and equip your instrument.
 2. Select the Roblox window in the macro. Refresh the list if necessary.
@@ -19,7 +19,8 @@ Use **Join Discord** at the bottom of the window or [join the community here](ht
 
 ## What it does
 
-- Detects the rotating white pointer and narrow green **Perfect** segment. Two visible green remnants can identify an arc split by the pointer; a completely hidden target cannot be newly inferred. A click requires an observed overlap in a fresh frame and an estimated arrival that stays inside Perfect after input latency.
+- Detects the rotating white pointer and narrow green **Perfect** segment. Two visible green remnants can identify an arc split by the pointer; a completely hidden target cannot be newly inferred. After stable tracking, a short timed click accounts for capture age and input latency, with both dispatch and estimated arrival inside Perfect. Without reliable motion history, it requires a fresh observed overlap.
+- Captures only the verified ring area while tracking it, reducing screen-copy work. A missing ring or a changed window triggers a full-window capture again. Timed clicks expire before input dispatch and are interrupted by Pause/Stop.
 - Recovers a moved ring anywhere in the visible game window through a throttled search, then tracks its verified region. Saved calibration remains the first search location.
 - Matches Frequency and follows the moving catch field: **hold left mouse to move right; release to move left**. Measured relative velocity helps brake before overshooting the target and keep the dot near its middle while the target moves.
 - Keeps the physical cursor still during minigames. Selling is the only stage that moves it to a detected button.
@@ -40,9 +41,9 @@ Ring recovery searches only the selected game window and verifies the circle, na
 
 Open **Settings & calibration**, choose the relevant element, then show it in Roblox during the three-second countdown. Select it in the frozen image and press Enter to save or Escape to cancel. Use **Preview** to inspect recognition. **Diagnostics** saves images and recognition details locally; review and crop them before sharing.
 
-Ring status distinguishes a missing pointer or target from a frame that became too old to click. Local diagnostics include recent worker frames with capture time, analysis time, frame age, recognized angles, and click decisions. This short history is kept in memory and saved only when you request Diagnostics.
+Ring status distinguishes a missing pointer or target from a frame that became too old to click. Local diagnostics include recent worker frames with capture time, analysis time, frame age, capture mode and pixel count, recognized angles, scheduled waits, and click decisions. This short history is kept in memory and saved only when you request Diagnostics.
 
-**Perfect correction** adjusts estimated input latency in milliseconds, starting at 8 ms. Increase it if clicks consistently land after the small Perfect segment. This only rejects clicks projected to arrive too late; it never permits clicking while the observed pointer is outside Perfect.
+**Perfect correction** adjusts estimated input latency in milliseconds, starting at 8 ms. Increase it if clicks consistently land after the small Perfect segment. With at least three measured pointer movements and a stable target, the macro can schedule a nearby upcoming overlap instead of waiting for another screenshot to land exactly on green. It requires the projected pointer to be inside the narrow target throughout the dispatch-to-arrival interval, reserves a margin for measurement uncertainty, and never schedules a full revolution ahead. Clicks based on an expired frame or an expired input deadline are rejected.
 
 If the sale has a separate confirmation button, calibrate **Sale confirmation**. The stock layout expects a second click on Sell All. Inventory uses the physical backtick key (scan code `0x29`, normally below Escape), independent of the typed character. The game's inventory binding needs to use this key.
 

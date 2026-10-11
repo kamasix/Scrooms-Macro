@@ -220,6 +220,336 @@ class EngineChecks(unittest.TestCase):
         actions = self.engine.step(Observation(charge=ring), (1080, 1920, 3), 1.3, captured_at=1)
         self.assertNotIn("tap", [a.kind for a in actions])
 
+    def timed_ring_frame(self, marker, captured_at, age=.003, *, center=1,
+                         width=.15, geometry=(120, 120), confidence=.99,
+                         observed=True):
+        ring = BarTrack((0, 0, 240, 240), marker % math.tau,
+                        (center - width / 2) % math.tau,
+                        (center + width / 2) % math.tau, "angle", confidence,
+                        center=geometry, radius=84, zone_observed=observed,
+                        outline_radius=100)
+        return self.engine.step(Observation(charge=ring), (1080, 1920, 3),
+                                captured_at + age, captured_at=captured_at)
+
+    def assert_timed_green_window(self, action, marker, captured_at, speed,
+                                 *, center=1, width=.15, age=.003, latency=.008):
+        self.assertEqual(action.kind, "tap")
+        self.assertIsNotNone(action.execute_at)
+        self.assertLessEqual(captured_at + age, action.not_before)
+        self.assertLessEqual(action.not_before, action.execute_at)
+        self.assertLessEqual(action.execute_at, action.expires_at)
+        self.assertLessEqual(action.execute_at - captured_at - age, .030 + 1e-10)
+        self.assertLessEqual(action.expires_at - captured_at, .025 + 1e-10)
+        # Every permitted dispatch, including the last possible one, must
+        # remain green throughout the configured input-delay interval.
+        for dispatch in (action.not_before, action.execute_at, action.expires_at):
+            for impact in (dispatch, dispatch + latency):
+                position = marker + speed * (impact - captured_at)
+                delta = (position - center + math.pi) % math.tau - math.pi
+                self.assertLessEqual(abs(delta), width / 2)
+
+    def test_stable_near_entry_model_waits_for_actual_green_before_dispatch(self):
+        self.config["input_latency"] = .008
+        action = None
+        for index in range(50):
+            captured, marker = 1 + index * .004, .2 + 5.3 * index * .004
+            actions = self.timed_ring_frame(marker, captured)
+            action = next((a for a in actions if a.kind == "tap"), None)
+            if action is not None:
+                break
+        self.assertIsNotNone(action)
+        self.assertLess(marker, .925)
+        self.assert_timed_green_window(action, marker, captured, 5.3)
+        self.assertGreater(action.not_before, captured + .003)
+        self.assertEqual(self.engine.phase, "transition")
+
+    def test_stable_observed_green_tap_also_has_an_expiry(self):
+        self.config["input_latency"] = .008
+        # Keep the optional release mode during grey observations to reach a
+        # green capture without accepting an earlier click-mode prediction.
+        self.config["charge_action"] = "release"
+        for index in range(35):
+            self.timed_ring_frame(.2 + 5.3 * index * .004, 1 + index * .004)
+        self.config["charge_action"] = "click"
+        action, = self.timed_ring_frame(.942, 1.14)
+        self.assert_timed_green_window(action, .942, 1.14, 5.3)
+        # A 20 ms preflight delay must not be allowed to reuse this tap.
+        self.assertLess(action.expires_at, 1.163)
+
+    def test_three_positions_do_not_authorize_near_entry_prediction(self):
+        self.config["input_latency"] = .008
+        for marker, captured in ((.74, 1), (.80, 1.02), (.86, 1.04)):
+            actions = self.timed_ring_frame(marker, captured)
+            self.assertEqual([a.kind for a in actions], ["up"])
+        self.assertFalse(self.engine.charge_timing_reliable)
+
+    def test_stable_far_grey_never_schedules_a_later_revolution(self):
+        self.config["input_latency"] = .008
+        for marker, captured in ((.2, 1), (.3, 1.02), (.4, 1.04), (.5, 1.06)):
+            actions = self.timed_ring_frame(marker, captured)
+            self.assertEqual([a.kind for a in actions], ["up"])
+        self.assertTrue(self.engine.charge_timing_reliable)
+        self.assertEqual(self.engine.phase, "charge")
+
+    def test_stable_late_green_with_no_dispatch_window_is_rejected(self):
+        self.config["input_latency"] = .008
+        for marker, captured in ((.64, 1), (.76, 1.02), (.88, 1.04)):
+            self.assertEqual([a.kind for a in self.timed_ring_frame(marker, captured)], ["up"])
+        actions = self.timed_ring_frame(1.00, 1.06, age=.002)
+        self.assertEqual([a.kind for a in actions], ["up"])
+        self.assertTrue(self.engine.charge_timing_reliable)
+        self.assertEqual(self.engine.phase, "charge")
+
+    def test_reverse_prediction_preserves_the_green_window_across_angle_zero(self):
+        self.config["input_latency"] = .008
+        action = None
+        for index in range(50):
+            captured, marker = 1 + index * .004, .8 - 7 * index * .004
+            actions = self.timed_ring_frame(marker, captured, center=.015)
+            action = next((a for a in actions if a.kind == "tap"), None)
+            if action is not None:
+                break
+        self.assertIsNotNone(action)
+        self.assert_timed_green_window(action, marker, captured, -7, center=.015)
+
+    def test_duplicate_rendered_frame_retains_motion_without_becoming_new_evidence(self):
+        self.config["input_latency"] = .008
+        for marker, captured in ((.5, 1), (.62, 1.02), (.74, 1.04)):
+            self.timed_ring_frame(marker, captured)
+        self.assertEqual([a.kind for a in self.timed_ring_frame(.74, 1.045)], ["up"])
+        self.assertEqual(len(self.engine.charge_samples), 3)
+        self.assertEqual(self.engine.previous_charge, (.74, 1.04))
+        actions = self.timed_ring_frame(.86, 1.06)
+        self.assertEqual(len(self.engine.charge_samples), 4)
+        self.assertAlmostEqual(self.engine.charge_speeds[-1], 6)
+        # These coarse 20 ms samples provide a wide render-time interval.
+        # Retaining speed must not authorize a click through that uncertainty.
+        self.assertEqual([a.kind for a in actions], ["up"])
+
+    def test_late_duplicate_green_cannot_fall_back_to_an_unbounded_tap(self):
+        self.config["input_latency"] = .008
+        for marker, captured in ((.5, 1), (.62, 1.02), (.74, 1.04)):
+            self.timed_ring_frame(marker, captured)
+        # A slow capture first observes green after its usable click window.
+        self.assertEqual([a.kind for a in self.timed_ring_frame(.98, 1.08, age=.028)], ["up"])
+        # A fresh capture repeats those same pixels; their first-seen position
+        # is still 31 ms old, although the new screenshot is only 1 ms old.
+        actions = self.timed_ring_frame(.98, 1.11, age=.001)
+        self.assertEqual([a.kind for a in actions], ["up"])
+        self.assertEqual(self.engine.previous_charge, (.98, 1.08))
+        self.assertEqual(self.engine.phase, "charge")
+        self.assertIn("reading again", self.engine.status)
+
+    def test_clear_target_or_geometry_change_invalidates_the_old_timing_model(self):
+        self.config["input_latency"] = .008
+        for changed in ({"center": 1.04}, {"geometry": (132, 120)}, {"width": .22}):
+            with self.subTest(changed=changed):
+                self.engine.start(0)
+                for marker, captured in ((.2, 1), (.35, 1.02), (.5, 1.04), (.65, 1.06)):
+                    self.timed_ring_frame(marker, captured)
+                actions = self.timed_ring_frame(.87, 1.0893333333333333, **changed)
+                self.assertEqual([a.kind for a in actions], ["up"])
+                self.assertEqual(len(self.engine.charge_samples), 1)
+                self.assertEqual(len(self.engine.charge_targets), 1)
+
+    def test_small_target_centroid_jitter_keeps_a_safe_timing_model(self):
+        self.config["input_latency"] = .008
+        action = None
+        for index in range(50):
+            captured, marker = 1 + index * .004, .2 + 5.3 * index * .004
+            actions = self.timed_ring_frame(marker, captured, center=1 + .003 * math.sin(index))
+            action = next((a for a in actions if a.kind == "tap"), None)
+            if action is not None:
+                break
+        self.assertIsNotNone(action)
+        # The underlying target center is 1; the measured +/- .003 rad jitter
+        # must be included in the uncertainty allowance rather than widening it.
+        self.assert_timed_green_window(action, marker, captured, 5.3)
+
+    def test_unstable_or_unobserved_motion_never_predicts_from_grey(self):
+        self.config["input_latency"] = .008
+        for marker, captured in ((.4, 1), (.5, 1.02), (.62, 1.04), (.80, 1.06)):
+            self.assertEqual([a.kind for a in self.timed_ring_frame(marker, captured)], ["up"])
+        self.assertEqual(self.engine.phase, "charge")
+        for final_settings in ({"observed": False}, {"confidence": .84}):
+            self.engine.start(0)
+            for marker, captured in ((.2, 1), (.35, 1.02), (.5, 1.04), (.65, 1.06)):
+                self.timed_ring_frame(marker, captured)
+            actions = self.timed_ring_frame(.90, 1.0933333333333333, **final_settings)
+            self.assertEqual([a.kind for a in actions], ["up"])
+
+    def test_gap_or_recognition_jump_requires_new_motion_evidence(self):
+        self.config["input_latency"] = .008
+        for captured in (1.4, 1.065):
+            self.engine.start(0)
+            for marker, stamp in ((.2, 1), (.35, 1.02), (.5, 1.04), (.65, 1.06)):
+                self.timed_ring_frame(marker, stamp)
+            actions = self.timed_ring_frame(.90, captured)
+            self.assertEqual([a.kind for a in actions], ["up"])
+            self.assertEqual(len(self.engine.charge_samples), 1)
+
+    def test_input_delay_longer_than_green_dwell_never_schedules_a_tap(self):
+        self.config["input_latency"] = .030
+        for marker, captured in ((.3, 1), (.46, 1.02), (.62, 1.04), (.78, 1.06), (.94, 1.08)):
+            self.assertEqual([a.kind for a in self.timed_ring_frame(marker, captured)], ["up"])
+        self.assertTrue(self.engine.charge_timing_reliable)
+
+    def test_start_pause_and_stage_change_discard_charge_prediction_history(self):
+        for reset in (lambda: self.engine.start(2), lambda: self.engine.pause(),
+                      lambda: self.engine._enter("tuning", 2)):
+            self.engine.start(0)
+            for marker, captured in ((.2, 1), (.3, 1.02), (.4, 1.04), (.5, 1.06)):
+                self.timed_ring_frame(marker, captured)
+            self.assertTrue(self.engine.charge_timing_reliable)
+            reset()
+            self.assertFalse(self.engine.charge_samples)
+            self.assertFalse(self.engine.charge_targets)
+            self.assertFalse(self.engine.charge_render_samples)
+            self.assertIsNone(self.engine.charge_observed_at)
+            self.assertIsNone(self.engine.charge_pending_change)
+            self.assertFalse(self.engine.charge_has_duplicates)
+            self.assertFalse(self.engine.charge_timing_reliable)
+
+    def test_first_crossing_cadence_matrix_has_no_outside_green_dispatches(self):
+        # Sample every capture phase across one frame interval, with enough
+        # grey observations to establish motion before the first encounter.
+        # Even changing captures have uncertain render phase. Slow captures
+        # may have no provably safe window; a fast 5.3 rad/s lane covers phases.
+        cases = ((30, 5, .003, 0), (60, 4, .020, 0),
+                 (60, 8, .003, 0), (60, 8, .020, 0),
+                 (120, 4, .003, 64), (240, 5.3, .003, 64))
+        for fps, speed, age, minimum_hits in cases:
+            hits = 0
+            for offset in range(64):
+                with self.subTest(fps=fps, speed=speed, age=age, offset=offset):
+                    self.engine = Engine({"input_latency": .008, "auto_sell": False})
+                    self.engine.start(0)
+                    crossing = .20 + offset / fps / 64
+                    for index in range(math.ceil((crossing + .04) * fps) + 1):
+                        captured = 1 + index / fps
+                        marker = 1 + speed * (index / fps - crossing)
+                        actions = self.timed_ring_frame(marker, captured, age)
+                        tap = next((a for a in actions if a.kind == "tap"), None)
+                        if tap is not None:
+                            hits += 1
+                            self.assert_timed_green_window(tap, marker, captured, speed, age=age)
+                            break
+            self.assertGreaterEqual(hits, minimum_hits)
+
+    def test_quantized_render_cadence_with_capture_jitter_has_no_unsafe_clicks(self):
+        # The real displayed pointer advances at 60 Hz while captures arrive
+        # every 4 ms. Its first-seen capture is not its actual appearance time.
+        cases = ((8, 0, 80), (8, .0005, 90), (8, .001, 90),
+                 (5.3, .001, 127), (-8, .001, 90))
+        for speed, jitter, minimum_hits in cases:
+            hits = 0
+            for offset in range(16):
+                for render_phase_index in range(8):
+                    with self.subTest(speed=speed, jitter=jitter, offset=offset,
+                                      render_phase=render_phase_index):
+                        self.engine = Engine({"input_latency": .008, "auto_sell": False})
+                        self.engine.start(0)
+                        crossing = .20 + offset * .004 / 16
+                        render_phase = render_phase_index / 8 / 60
+                        for index in range(math.ceil((crossing + .04) / .004) + 1):
+                            relative = index * .004 + jitter * math.sin(index * 1.7 + offset)
+                            rendered = math.floor((relative - render_phase) * 60 + 1e-9) / 60 + render_phase
+                            captured = 1 + relative
+                            displayed_marker = 1 + speed * (rendered - crossing)
+                            actions = self.timed_ring_frame(displayed_marker, captured)
+                            tap = next((a for a in actions if a.kind == "tap"), None)
+                            if tap is not None:
+                                hits += 1
+                                true_marker_at_capture = 1 + speed * (relative - crossing)
+                                self.assert_timed_green_window(tap, true_marker_at_capture,
+                                                               captured, speed)
+                                break
+            self.assertGreaterEqual(hits, minimum_hits)
+
+    def test_sub_four_ms_change_retains_its_original_appearance_interval(self):
+        # This independent replay previously scheduled a reverse 9 rad/s tap
+        # at .124492 s while the actual pointer was still +.079569 rad (grey).
+        # A new position was first seen before the velocity estimator's 4 ms
+        # minimum; its later processing must not replace that first sighting.
+        rows = ((0., 1.3434338225316757),
+                (.003763424989941566, 1.1933167610903317),
+                (.008132935705261149, 1.1933167610903317),
+                (.016786338377770025, 1.1933167610903317),
+                (.020824367697639262, 1.0431047775424134),
+                (.03384284703827462, 1.0431047775424134),
+                (.03869442360262156, .8938598172110199),
+                (.046134089818466, .8938598172110199),
+                (.05073335371266053, .7436978652607815),
+                (.06573338903290392, .7436978652607815),
+                (.06979501294780383, .5938385416617085),
+                (.08185492598192706, .5938385416617085),
+                (.08606738838858623, .44296996146180656),
+                (.09764439904847877, .44296996146180656),
+                (.10157149490459089, .2925901661009733))
+        self.config["input_latency"] = .008
+        for captured, marker in rows:
+            actions = self.timed_ring_frame(marker, captured, age=.002, center=0)
+            self.assertNotIn("tap", [a.kind for a in actions])
+        first_interval = self.engine.charge_render_samples[0]
+        self.assertEqual(first_interval[:2], (0., .003763424989941566))
+        self.assertAlmostEqual(first_interval[2], 1.1933167610903317)
+
+    def test_quantized_centroid_noise_and_sub_four_ms_capture_jitter_stay_green(self):
+        hits = 0
+        for speed in (-9, -8, 8, 9):
+            for capture_dt in (.004, 1 / 240):
+                for offset in range(16):
+                    for render_phase_index in range(4):
+                        self.engine = Engine({"input_latency": .008, "auto_sell": False})
+                        self.engine.start(0)
+                        base_marker = 1 - math.copysign(1.2, speed)
+                        crossing = 1.2 / abs(speed)
+                        render_phase = render_phase_index / 4 / 60
+                        for index in range(math.ceil((crossing + .04) / capture_dt) + 1):
+                            relative = index * capture_dt + .0008 * math.sin(index * 1.7 + offset)
+                            rendered_index = math.floor((relative - render_phase) * 60 + 1e-9)
+                            rendered = rendered_index / 60 + render_phase
+                            # Noise is fixed for each rendered frame, so fast
+                            # captures repeat both its position and its jitter.
+                            noise = .002 * math.sin(rendered_index * 1.73 + offset)
+                            marker = base_marker + speed * rendered + noise
+                            captured = 1 + relative
+                            actions = self.timed_ring_frame(marker, captured, age=.002)
+                            tap = next((a for a in actions if a.kind == "tap"), None)
+                            if tap is not None:
+                                hits += 1
+                                self.assert_timed_green_window(tap, base_marker + speed * relative,
+                                                               captured, speed, age=.002)
+                                break
+        self.assertGreater(hits, 0)
+
+    def test_changing_every_capture_does_not_hide_quantized_render_phase(self):
+        # This 120 Hz display/capture replay has no duplicate images. An exact
+        # first-seen-time fit previously sent a click whose arrival pointer
+        # was -.091725 rad, outside the actual +/- .075 rad target.
+        rows = ((0., 1.2582974072376683),
+                (.008913552648643224, 1.181978670785549),
+                (.01714782087726538, 1.1091549593950853),
+                (.02602687280843697, 1.0341020808259054),
+                (.03373568174339165, .9569588286659682),
+                (.04141089282348726, .8849165144387169),
+                (.049127787830591546, .8088582822055408),
+                (.05694859679767463, .7344487924824309),
+                (.06570801836398467, .6584512463277115),
+                (.07446846233890306, .5836801981889191),
+                (.08304362673531522, .5073419646838194),
+                (.0908768518044506, .4326837488148915),
+                (.09915933846158992, .35900889537636677),
+                (.10810506821131297, .2821172901496122),
+                (.11622222025859408, .20862888456482298))
+        self.config["input_latency"] = .008
+        for captured, marker in rows:
+            actions = self.timed_ring_frame(marker, captured, age=.002, center=0)
+            self.assertNotIn("tap", [a.kind for a in actions])
+        self.assertFalse(self.engine.charge_has_duplicates)
+        self.assertEqual(len(self.engine.charge_render_samples), 14)
+        self.assertEqual(self.engine.phase, "charge")
+
     def test_tuning_holds_for_right_target_and_releases_for_left_target(self):
         track = TuneTrack(1058, 435, (425, 800, 1060, 150), .99, 836)
         actions = self.step(Observation(tuning=track), 1)

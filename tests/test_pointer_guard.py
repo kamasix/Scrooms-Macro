@@ -543,6 +543,49 @@ class TapControllerTests(unittest.TestCase):
         app.desktop.tap.assert_not_called()
         self.assertEqual(app.engine.phase, "charge")
 
+    def _fallback_tap_app(self, accepted):
+        from shrooms_macro.app import Application
+
+        app = Application.__new__(Application)
+        app.target = 101
+        app.desktop = MagicMock()
+        app.desktop.tap.return_value = accepted
+        app.input_cancel = threading.Event()
+        app.engine = SimpleNamespace(phase="transition", status="Perfect")
+        app.last_frame_metrics = {"tap_called": False}
+        return app
+
+    def test_immediate_fallback_carries_capture_freshness_to_backend(self):
+        from shrooms_macro.engine import Action
+
+        app = self._fallback_tap_app(True)
+        with patch("shrooms_macro.app.time.perf_counter", return_value=1.01):
+            app._action(Action("tap"), captured_at=1)
+        app.desktop.tap.assert_called_once_with(101, cancel=app.input_cancel, deadline=1.025)
+        self.assertTrue(app.last_frame_metrics["tap_called"])
+        self.assertTrue(app.last_frame_metrics["tap_accepted"])
+
+    def test_immediate_fallback_rejected_during_backend_preflight_reacquires_ring(self):
+        from shrooms_macro.engine import Action
+
+        app = self._fallback_tap_app(False)
+        with patch("shrooms_macro.app.time.perf_counter", return_value=1.01):
+            app._action(Action("tap"), captured_at=1)
+        app.desktop.tap.assert_called_once_with(101, cancel=app.input_cancel, deadline=1.025)
+        self.assertEqual(app.engine.phase, "charge")
+        self.assertIn("expired before input", app.engine.status)
+        self.assertFalse(app.last_frame_metrics["tap_accepted"])
+
+    def test_immediate_fallback_rejects_nonfinite_capture_timestamp(self):
+        from shrooms_macro.engine import Action
+
+        for captured_at in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(captured_at=captured_at):
+                app = self._fallback_tap_app(True)
+                with self.assertRaisesRegex(RuntimeError, "Invalid Perfect capture timestamp"):
+                    app._action(Action("tap"), captured_at=captured_at)
+                app.desktop.tap.assert_not_called()
+
     def test_stationary_tap_is_restricted_to_perfect_stages(self):
         from shrooms_macro.app import Application
         from shrooms_macro.engine import Action
@@ -595,6 +638,134 @@ class TapControllerTests(unittest.TestCase):
         app.desktop.mouse_up.assert_called_once()
         app.desktop.key_up.assert_called_once()
         app.engine.pause.assert_called_once_with("Paused")
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows backend")
+class TimedTapControllerTests(unittest.TestCase):
+    def setUp(self):
+        from shrooms_macro.app import Application
+
+        self.app = Application.__new__(Application)
+        self.app.target = 101
+        self.app.generation = 7
+        self.app.desktop = MagicMock()
+        self.app.desktop.tap.return_value = True
+        self.app.input_cancel = MagicMock()
+        self.app.input_cancel.is_set.return_value = False
+        self.app.input_cancel.wait.return_value = False
+        self.app.active = threading.Event()
+        self.app.active.set()
+        self.app.engine = SimpleNamespace(phase="transition", status="Perfect")
+        self.app.last_frame_metrics = {"tap_called": False, "tap_accepted": False}
+        self.action = SimpleNamespace(kind="tap", not_before=1.012,
+                                      execute_at=1.015, expires_at=1.018)
+
+    def dispatch(self, after_wait=1.015, captured_at=1):
+        with patch("shrooms_macro.app.time.perf_counter", side_effect=[1, after_wait]):
+            self.app._action(self.action, captured_at=captured_at)
+
+    def test_timed_tap_waits_briefly_and_passes_the_deadline_to_backend(self):
+        self.dispatch()
+        self.assertAlmostEqual(self.app.input_cancel.wait.call_args.args[0], .015)
+        self.assertLessEqual(self.app.input_cancel.wait.call_args.args[0], .030)
+        self.app.desktop.tap.assert_called_once_with(
+            101, cancel=self.app.input_cancel, deadline=1.018)
+        self.assertTrue(self.app.last_frame_metrics["tap_called"])
+        self.assertTrue(self.app.last_frame_metrics["tap_accepted"])
+
+    def test_interrupted_wait_sends_no_input(self):
+        self.app.input_cancel.wait.return_value = True
+        self.dispatch()
+        self.app.desktop.tap.assert_not_called()
+        self.assertFalse(self.app.last_frame_metrics["tap_called"])
+
+    def test_cancelled_before_wait_sends_no_input_or_wait(self):
+        self.app.input_cancel.is_set.return_value = True
+        self.dispatch()
+        self.app.input_cancel.wait.assert_not_called()
+        self.app.desktop.tap.assert_not_called()
+
+    def test_wait_overrun_reacquires_ring_without_input(self):
+        self.dispatch(after_wait=1.020)
+        self.app.desktop.tap.assert_not_called()
+        self.assertEqual(self.app.engine.phase, "charge")
+        self.assertIn("window passed", self.app.engine.status)
+
+    def test_backend_deadline_rejection_reacquires_ring(self):
+        self.app.desktop.tap.return_value = False
+        self.dispatch()
+        self.assertTrue(self.app.last_frame_metrics["tap_called"])
+        self.assertFalse(self.app.last_frame_metrics["tap_accepted"])
+        self.assertEqual(self.app.engine.phase, "charge")
+        self.assertIn("expired before input", self.app.engine.status)
+
+    def test_generation_change_during_wait_cancels_input(self):
+        def change_generation(_delay):
+            self.app.generation += 1
+            return False
+
+        self.app.input_cancel.wait.side_effect = change_generation
+        self.dispatch()
+        self.app.desktop.tap.assert_not_called()
+
+    def test_target_change_during_wait_cancels_input(self):
+        def change_target(_delay):
+            self.app.target = 202
+            return False
+
+        self.app.input_cancel.wait.side_effect = change_target
+        self.dispatch()
+        self.app.desktop.tap.assert_not_called()
+
+    def test_stop_during_wait_cancels_input(self):
+        def stop(_delay):
+            self.app.active.clear()
+            return False
+
+        self.app.input_cancel.wait.side_effect = stop
+        self.dispatch()
+        self.app.desktop.tap.assert_not_called()
+
+    def test_valid_window_still_rejects_capture_older_than_25_ms(self):
+        self.dispatch(captured_at=.98)
+        self.app.desktop.tap.assert_not_called()
+        self.assertEqual(self.app.engine.phase, "charge")
+        self.assertIn("frame too old", self.app.engine.status)
+        self.assertAlmostEqual(self.app.last_frame_metrics["dispatch_age_ms"], 35)
+
+    def test_wait_beyond_30_ms_is_rejected_without_wait_or_input(self):
+        self.action.execute_at = 1.031
+        self.action.expires_at = 1.04
+        with self.assertRaisesRegex(RuntimeError, "too far ahead"):
+            self.dispatch()
+        self.app.input_cancel.wait.assert_not_called()
+        self.app.desktop.tap.assert_not_called()
+
+    def test_invalid_click_window_is_rejected_before_wait(self):
+        self.action.not_before = 1.02
+        with self.assertRaisesRegex(RuntimeError, "Invalid Perfect click window"):
+            self.dispatch()
+        self.app.input_cancel.wait.assert_not_called()
+        self.app.desktop.tap.assert_not_called()
+
+    def test_partial_click_window_is_rejected_without_wait_or_input(self):
+        for missing in ("not_before", "execute_at", "expires_at"):
+            with self.subTest(missing=missing):
+                self.action = SimpleNamespace(kind="tap", not_before=1.012,
+                                              execute_at=1.015, expires_at=1.018)
+                setattr(self.action, missing, None)
+                with self.assertRaisesRegex(RuntimeError, "Invalid Perfect click window"):
+                    self.dispatch()
+                self.app.input_cancel.wait.assert_not_called()
+                self.app.desktop.tap.assert_not_called()
+
+    def test_timed_click_requires_a_finite_capture_timestamp(self):
+        for captured_at in (None, float("nan"), float("inf"), float("-inf")):
+            with self.subTest(captured_at=captured_at):
+                with self.assertRaisesRegex(RuntimeError, "Invalid Perfect (click window|capture timestamp)"):
+                    self.dispatch(captured_at=captured_at)
+                self.app.input_cancel.wait.assert_not_called()
+                self.app.desktop.tap.assert_not_called()
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows backend")
@@ -684,6 +855,7 @@ class FrameMetricsControllerTests(unittest.TestCase):
         self.app.root = MagicMock()
         self.app.ui = MagicMock()
         self.app.desktop = MagicMock()
+        self.app.desktop.tap.return_value = True
         self.app.desktop.key_up.return_value = True
         self.app.desktop.is_foreground.return_value = True
         self.app.desktop.cursor_over.return_value = True
@@ -732,9 +904,11 @@ class FrameMetricsControllerTests(unittest.TestCase):
     def test_successful_new_run_clears_previous_frame_history(self):
         self.app.last_frame_metrics = {"tap_called": True}
         self.app._record_frame_metrics()
+        self.app.last_full_frame_shape = (1080, 1920, 3)
         self.app.finish_start()
         self.assertEqual(self.app.last_frame_metrics, {})
         self.assertEqual(len(self.app.frame_metrics_history), 0)
+        self.assertIsNone(self.app.last_full_frame_shape)
         self.assertTrue(self.app.active.is_set())
         self.app.engine.start.assert_called_once()
 
@@ -758,6 +932,7 @@ class FrameMetricsControllerTests(unittest.TestCase):
         sample = self._run_one_mocked_frame(.007)
         self.assertTrue(sample["tap_requested"])
         self.assertTrue(sample["tap_called"])
+        self.assertTrue(sample["tap_accepted"])
         self.assertAlmostEqual(sample["pointer_angle_rad"], 1.24)
         self.assertAlmostEqual(sample["perfect_center_rad"], 1.24)
         self.assertAlmostEqual(sample["perfect_size_rad"], .08)
@@ -771,9 +946,11 @@ class FrameMetricsControllerTests(unittest.TestCase):
             "capture_ms", "analysis_ms", "decision_age_ms", "dispatch_age_ms",
             "ring_present", "ring_recognized", "ring_diagnostic", "pointer_angle_rad",
             "perfect_center_rad", "perfect_size_rad", "tap_called", "tap_requested",
-            "decision_status", "phase", "status",
+            "decision_status", "phase", "status", "capture_mode", "capture_pixels",
+            "roi_fallback_ms", "tap_accepted",
         })
-        self.app.desktop.tap.assert_called_once_with(101, cancel=self.app.input_cancel)
+        self.app.desktop.tap.assert_called_once_with(
+            101, cancel=self.app.input_cancel, deadline=.002 + .025)
 
     def test_worker_records_rejected_stale_tap_and_final_charge_status(self):
         sample = self._run_one_mocked_frame(.050)
@@ -783,6 +960,109 @@ class FrameMetricsControllerTests(unittest.TestCase):
         self.assertEqual(sample["phase"], "charge")
         self.assertIn("frame too old", sample["status"])
         self.app.desktop.tap.assert_not_called()
+
+    def _prepare_ring_crop(self):
+        from shrooms_macro.vision import BarTrack, Observation
+
+        region = (400, 300, 200, 200)
+        self.app.engine.phase = "charge"
+        self.app.last_full_frame_shape = (1080, 1920, 3)
+        self.app.detector.charge_capture_region.return_value = region
+        self.app.desktop.capture_region.return_value = SimpleNamespace(shape=(200, 200, 3))
+        self.app.desktop.capture.return_value = SimpleNamespace(shape=(1080, 1920, 3))
+        self.app.detector.analyze_charge.return_value = Observation(
+            charge=BarTrack(region, 1.24, 1.2, 1.28, "angle", .95),
+            ring_present=True, ring_diagnostic="Perfect and pointer recognized")
+        self.app.engine.step.return_value = []
+        self.app.shutdown.wait = MagicMock(side_effect=lambda _delay: self.app.shutdown.set())
+        return region
+
+    def _run_worker_once(self, timestamps):
+        with patch("shrooms_macro.app.time.perf_counter", side_effect=timestamps):
+            self.app.work()
+        self.assertEqual(len(self.app.frame_metrics_history), 1)
+        return self.app.frame_metrics_history[0]
+
+    def test_verified_ring_crop_avoids_full_capture_and_keeps_full_engine_coordinates(self):
+        region = self._prepare_ring_crop()
+        sample = self._run_worker_once([0, .001, .003, .004, .005, .006, .010])
+        self.app.desktop.capture_region.assert_called_once_with(101, (1080, 1920, 3), region)
+        self.app.desktop.capture.assert_not_called()
+        self.app.detector.analyze.assert_not_called()
+        self.app.detector.analyze_charge.assert_called_once_with(
+            self.app.desktop.capture_region.return_value, region, .002)
+        self.app.engine.step.assert_called_once_with(
+            self.app.detector.analyze_charge.return_value, (1080, 1920, 3), .006,
+            captured_at=.002)
+        self.assertEqual(sample["capture_mode"], "ring")
+        self.assertEqual(sample["capture_pixels"], 40000)
+        self.assertEqual(sample["roi_fallback_ms"], 0)
+        self.assertEqual(self.app.last_full_frame_shape, (1080, 1920, 3))
+
+    def test_worker_uses_240_hz_only_for_verified_ring_crops(self):
+        for use_crop, cadence in ((True, 240), (False, 120)):
+            with self.subTest(use_crop=use_crop):
+                self.setUp()
+                self._prepare_ring_crop()
+                if not use_crop:
+                    self.app.detector.charge_capture_region.return_value = None
+                    self.app.detector.analyze.return_value = self.app.detector.analyze_charge.return_value
+                sample = self._run_worker_once([0, .0001, .0003, .0004, .0005, .0006, .001])
+                self.app.shutdown.wait.assert_called_once()
+                remaining_wait = self.app.shutdown.wait.call_args.args[0]
+                self.assertAlmostEqual(remaining_wait + .001, 1 / cadence)
+                self.assertGreater(remaining_wait, 0)
+                self.assertEqual(sample["capture_mode"], "ring" if use_crop else "full")
+
+    def _check_same_iteration_fallback(self, full_observation):
+        from shrooms_macro.vision import Observation
+
+        self._prepare_ring_crop()
+        self.app.detector.analyze_charge.return_value = Observation(
+            ring_present=False, ring_diagnostic="Ring absent from prior crop")
+        self.app.detector.analyze.return_value = full_observation
+        sample = self._run_worker_once(
+            [0, .001, .003, .004, .005, .006, .008, .009, .010, .011, .012])
+        self.app.desktop.capture_region.assert_called_once()
+        self.app.desktop.capture.assert_called_once_with(101)
+        self.app.detector.analyze.assert_called_once_with(
+            self.app.desktop.capture.return_value, .007)
+        self.app.engine.step.assert_called_once_with(
+            full_observation, (1080, 1920, 3), .011, captured_at=.007)
+        self.assertEqual(sample["capture_mode"], "full")
+        self.assertEqual(sample["roi_fallback_ms"], 4)
+        self.assertEqual(sample["capture_pixels"], 1080 * 1920)
+
+    def test_missing_ring_in_crop_falls_back_to_tuning_in_same_iteration(self):
+        from shrooms_macro.vision import Observation, TuneTrack
+
+        self._check_same_iteration_fallback(Observation(
+            tuning=TuneTrack(700, 640, (400, 800, 1000, 120), .95, 900)))
+
+    def test_missing_ring_in_crop_falls_back_to_catch_in_same_iteration(self):
+        from shrooms_macro.vision import Observation, TargetTrack
+
+        self._check_same_iteration_fallback(Observation(
+            frequency=TargetTrack(700, 900, .95, (400, 800, 1000, 120)),
+            catch_present=True, catch_progress=.2))
+
+    def test_resized_client_falls_back_to_full_capture_and_refreshes_full_shape(self):
+        from shrooms_macro.vision import Observation
+
+        self._prepare_ring_crop()
+        self.app.desktop.capture_region.return_value = None
+        self.app.desktop.capture.return_value = SimpleNamespace(shape=(1440, 2560, 3))
+        self.app.detector.analyze.return_value = Observation()
+        sample = self._run_worker_once([0, .001, .002, .003, .005, .006, .007, .008, .010])
+        self.app.detector.analyze_charge.assert_not_called()
+        self.app.desktop.capture.assert_called_once_with(101)
+        self.app.engine.step.assert_called_once_with(
+            self.app.detector.analyze.return_value, (1440, 2560, 3), .008,
+            captured_at=.004)
+        self.assertEqual(sample["capture_mode"], "full")
+        self.assertEqual(sample["roi_fallback_ms"], 1)
+        self.assertEqual(sample["capture_pixels"], 1440 * 2560)
+        self.assertEqual(self.app.last_full_frame_shape, (1440, 2560, 3))
 
 
 if __name__ == "__main__":

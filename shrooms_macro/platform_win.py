@@ -11,11 +11,13 @@ import math
 import os
 import sys
 import threading
+import time
 from ctypes import wintypes
 from dataclasses import dataclass
 from typing import Iterable
 
 import numpy as np
+import cv2
 
 
 class InputUnavailable(RuntimeError):
@@ -332,13 +334,24 @@ class Desktop:
         ctypes.set_last_error(0)
         return int(_user32.SendInput(len(entries), batch, ctypes.sizeof(_INPUT)))
 
-    def _send_target(self, hwnd: int, items: Iterable[_INPUT]) -> None:
+    def _send_target(self, hwnd: int, items: Iterable[_INPUT], *,
+                     deadline: float | None = None,
+                     cancel: threading.Event | None = None) -> bool:
         entries = tuple(items)
         with self._input_lock:
             try:
+                if deadline is not None and not math.isfinite(deadline):
+                    raise ValueError("The input deadline must be finite.")
                 self._guard(hwnd)
+                # Foreground and pointer checks can themselves take time.
+                # Reject an expired Perfect press at the last preflight point.
+                if cancel is not None and cancel.is_set():
+                    return False
+                if deadline is not None and time.perf_counter() > deadline:
+                    return False
                 if self._send_raw(entries) != len(entries):
                     raise InputUnavailable("Windows did not accept the mouse or keyboard event.")
+                return True
             except Exception:
                 self.mouse_up()
                 raise
@@ -349,9 +362,56 @@ class Desktop:
         Roblox must remain visible and unobscured. Reading the visible desktop
         supports DirectX game rendering without hooks or process access.
         """
+        try:
+            return self._capture_bounds(self.client_rect(hwnd))
+        except Exception:
+            self.mouse_up()
+            raise
+
+    def capture_region(self, hwnd: int, expected_shape: tuple[int, ...],
+                       region: tuple[int, int, int, int]) -> np.ndarray | None:
+        """Capture a verified client-relative rectangle without changing its origin.
+
+        A resized client or invalid rectangle requests full-frame reacquisition
+        by returning ``None``. A lost window or foreground focus pauses input.
+        The screen origin is read again for every capture, including on monitors
+        whose desktop coordinates are negative.
+        """
+        try:
+            self._guard(hwnd)
+            bounds = self.client_rect(hwnd)
+            try:
+                if len(expected_shape) < 2 or len(region) != 4:
+                    return None
+                height, width = (int(value) for value in expected_shape[:2])
+                values = tuple(int(value) for value in region)
+                if tuple(region) != values:
+                    return None
+                x, y, region_width, region_height = values
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if ((height, width) != (bounds.height, bounds.width)
+                    or x < 0 or y < 0 or region_width <= 0 or region_height <= 0
+                    or x + region_width > width or y + region_height > height):
+                return None
+            frame = self._capture_bounds(Rect(bounds.left + x, bounds.top + y,
+                                              region_width, region_height))
+            # Do not dispatch an input from a capture completed after another
+            # window took focus.
+            self._guard(hwnd)
+            if self.client_rect(hwnd) != bounds:
+                # A move or resize during BitBlt invalidates the coordinate
+                # context, even while Roblox keeps foreground focus.
+                return None
+            return frame
+        except Exception:
+            self.mouse_up()
+            raise
+
+    @staticmethod
+    def _capture_bounds(bounds: Rect) -> np.ndarray:
         source_dc = memory_dc = bitmap = previous = None
         try:
-            bounds = self.client_rect(hwnd)
             source_dc = _user32.GetDC(None)
             if not source_dc:
                 raise InputUnavailable("Windows did not provide an image of the Roblox window.")
@@ -383,10 +443,9 @@ class Desktop:
             buffer = (ctypes.c_ubyte * (bounds.width * bounds.height * 4)).from_address(
                 pixels.value)
             bgra = np.ctypeslib.as_array(buffer).reshape(bounds.height, bounds.width, 4)
-            return bgra[:, :, :3].copy()
-        except Exception:
-            self.mouse_up()
-            raise
+            # OpenCV removes the alpha channel without the slow strided NumPy
+            # copy. Its returned BGR array owns its storage after GDI cleanup.
+            return cv2.cvtColor(bgra, cv2.COLOR_BGRA2BGR)
         finally:
             if previous and memory_dc:
                 _gdi32.SelectObject(memory_dc, previous)
@@ -446,20 +505,25 @@ class Desktop:
             self.mouse_up()
             raise
 
-    def mouse_down(self, hwnd: int) -> None:
+    def mouse_down(self, hwnd: int, *, deadline: float | None = None,
+                   cancel: threading.Event | None = None) -> bool:
         with self._input_lock:
+            if deadline is not None and not math.isfinite(deadline):
+                raise ValueError("The input deadline must be finite.")
             self._guard(hwnd)
             if not self.cursor_over(hwnd):
                 self.mouse_up()
                 raise InputUnavailable("Place the cursor over an unobscured part of Roblox and press F6.")
             if self._left_held and self._held_hwnd == hwnd:
-                return
+                return True
             self.mouse_up()
             if self._left_held:
                 raise InputUnavailable("Windows did not release the previous mouse press.")
-            self._send_target(hwnd, [_mouse_input(0x0002)])
+            if not self._send_target(hwnd, [_mouse_input(0x0002)], deadline=deadline, cancel=cancel):
+                return False
             self._left_held = True
             self._held_hwnd = hwnd
+            return True
 
     def mouse_up(self) -> None:
         """Release only a press owned by this instance, without focus requirements."""
@@ -528,12 +592,14 @@ class Desktop:
         if self._left_held:
             raise InputUnavailable("Windows did not release the mouse press.")
 
-    def tap(self, hwnd: int, cancel: threading.Event | None = None) -> None:
+    def tap(self, hwnd: int, cancel: threading.Event | None = None, *,
+            deadline: float | None = None) -> bool:
         """Click at the current cursor position without moving it.
 
         An existing press owned by this macro is released first so the tap is a
         fresh button-down event. The bounded 5 ms hold keeps the release close
         to the timed press; cancellation/shutdown can release it sooner.
+        False means cancellation or an expired deadline prevented the press.
         """
         try:
             with self._input_lock:
@@ -541,12 +607,14 @@ class Desktop:
                 if self._left_held:
                     raise InputUnavailable("Windows did not release the previous mouse press.")
                 if cancel is not None and cancel.is_set():
-                    return
-                self.mouse_down(hwnd)
+                    return False
+                if not self.mouse_down(hwnd, deadline=deadline, cancel=cancel):
+                    return False
             if cancel is not None:
                 cancel.wait(0.005)
             else:
                 threading.Event().wait(0.005)
+            return True
         finally:
             self.mouse_up()
 

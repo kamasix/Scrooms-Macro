@@ -12,6 +12,9 @@ class Action:
     kind: str
     x: float = 0
     y: float = 0
+    not_before: float | None = None
+    execute_at: float | None = None
+    expires_at: float | None = None
 
 
 class _LinearMotion:
@@ -125,6 +128,13 @@ class Engine:
         self.success_latched = False
         self.previous_charge = None
         self.charge_speeds = deque(maxlen=5)
+        self.charge_samples = deque(maxlen=7)
+        self.charge_targets = deque(maxlen=7)
+        self.charge_render_samples = deque(maxlen=16)
+        self.charge_observed_at = None
+        self.charge_pending_change = None
+        self.charge_has_duplicates = False
+        self.charge_timing_reliable = False
         self.previous_control = None
         self.previous_target = None
         self.linear_motion = {}
@@ -145,6 +155,13 @@ class Engine:
         self.last_progress = None
         self.previous_charge = self.previous_control = self.previous_target = None
         self.charge_speeds.clear()
+        self.charge_samples.clear()
+        self.charge_targets.clear()
+        self.charge_render_samples.clear()
+        self.charge_observed_at = None
+        self.charge_pending_change = None
+        self.charge_has_duplicates = False
+        self.charge_timing_reliable = False
         self.linear_motion.clear()
         self.tuning_held = self.catch_held = False
         self.status = "Reading the game screen…"
@@ -157,12 +174,26 @@ class Engine:
         self.tuning_held = self.catch_held = False
         self.previous_charge = None
         self.charge_speeds.clear()
+        self.charge_samples.clear()
+        self.charge_targets.clear()
+        self.charge_render_samples.clear()
+        self.charge_observed_at = None
+        self.charge_pending_change = None
+        self.charge_has_duplicates = False
+        self.charge_timing_reliable = False
         self.linear_motion.clear()
         self.cast_pending = False
 
     def _enter(self, phase: str, now: float, delay: float = 0):
         if phase != self.phase:
             self.linear_motion.clear()
+            self.charge_samples.clear()
+            self.charge_targets.clear()
+            self.charge_render_samples.clear()
+            self.charge_observed_at = None
+            self.charge_pending_change = None
+            self.charge_has_duplicates = False
+            self.charge_timing_reliable = False
         self.phase, self.phase_started, self.deadline = phase, now, now + delay
 
     @staticmethod
@@ -257,8 +288,15 @@ class Engine:
 
     def _charge_velocity(self, position, sample_time, circular):
         """Repeated captures of one rendered frame must not erase its speed."""
+        previous_observation = self.charge_observed_at
+        self.charge_observed_at = sample_time
         if self.previous_charge is None:
             self.previous_charge = (position, sample_time)
+            self.charge_samples.clear()
+            self.charge_samples.append((sample_time, position))
+            self.charge_render_samples.clear()
+            self.charge_pending_change = None
+            self.charge_has_duplicates = False
             return 0.0
         old_position, old_time = self.previous_charge
         dt = sample_time - old_time
@@ -268,6 +306,11 @@ class Engine:
         if dt > 0.25 or dt <= 0:
             self.previous_charge = (position, sample_time)
             self.charge_speeds.clear()
+            self.charge_samples.clear()
+            self.charge_samples.append((sample_time, position))
+            self.charge_render_samples.clear()
+            self.charge_pending_change = None
+            self.charge_has_duplicates = False
             return 0.0
         minimum_change = 0.003 if circular else 0.001
         if abs(delta) >= minimum_change and dt >= 0.004:
@@ -275,14 +318,177 @@ class Engine:
             # A recognition jump cannot be used as a timing lead.
             if abs(speed) <= (40 if circular else 6):
                 self.charge_speeds.append(speed)
+                if not self.charge_samples:
+                    self.charge_samples.append((old_time, old_position))
+                self.charge_samples.append((sample_time, self.charge_samples[-1][1] + delta))
+                appearance_low, appearance_high = previous_observation, sample_time
+                if self.charge_pending_change is not None:
+                    pending_low, pending_high, pending_position = self.charge_pending_change
+                    pending_delta = position - pending_position
+                    if circular:
+                        pending_delta = (pending_delta + math.pi) % math.tau - math.pi
+                    if abs(pending_delta) <= .006:
+                        appearance_low, appearance_high = pending_low, pending_high
+                if (appearance_low is not None
+                        and 0 < appearance_high - appearance_low <= 0.05):
+                    # This changed rendered position first appeared somewhere
+                    # between the preceding capture and this capture.
+                    self.charge_render_samples.append((appearance_low, appearance_high,
+                                                       self.charge_samples[-1][1]))
+                    while (self.charge_render_samples
+                           and sample_time - self.charge_render_samples[0][1] > .25):
+                        self.charge_render_samples.popleft()
             else:
                 self.charge_speeds.clear()
+                self.charge_samples.clear()
+                self.charge_samples.append((sample_time, position))
+                self.charge_render_samples.clear()
+                self.charge_has_duplicates = False
+            self.charge_pending_change = None
             self.previous_charge = (position, sample_time)
+        elif abs(delta) >= minimum_change and dt < .004:
+            # The velocity estimator needs a minimum interval, but the first
+            # sighting must still bound when this rendered position appeared.
+            # Deferring that sighting would make its next capture falsely new.
+            if self.charge_pending_change is None:
+                self.charge_pending_change = (previous_observation, sample_time, position)
+            else:
+                pending_position = self.charge_pending_change[2]
+                pending_delta = position - pending_position
+                if circular:
+                    pending_delta = (pending_delta + math.pi) % math.tau - math.pi
+                if abs(pending_delta) > .006:
+                    self.charge_pending_change = (previous_observation, sample_time, position)
+        elif abs(delta) < minimum_change and previous_observation is not None and sample_time > previous_observation:
+            self.charge_has_duplicates = True
         if not self.charge_speeds:
             return 0.0
         # A median removes occasional one-frame centroid jitter.
         speeds = sorted(self.charge_speeds)
         return speeds[len(speeds) // 2]
+
+    def _observe_charge_target(self, track, sample_time):
+        """A timing model belongs to one repeatedly measured physical target."""
+        if self.charge_targets:
+            _, old_angle, old_size, old_center, old_radius, old_region = self.charge_targets[-1]
+            shift = abs((track.zone_angle - old_angle + math.pi) % math.tau - math.pi)
+            changed = shift > max(0.012, track.zone_size * 0.15)
+            changed |= abs(track.zone_size - old_size) > max(0.02, track.zone_size * 0.15)
+            if old_center is not None and track.center is not None:
+                changed |= math.dist(old_center, track.center) > max(2.0, track.outline_radius * 0.03)
+                changed |= abs(track.outline_radius - old_radius) > max(2.0, track.outline_radius * 0.03)
+            else:
+                changed |= old_center != track.center or old_region != track.region
+            if changed:
+                self.previous_charge = None
+                self.charge_speeds.clear()
+                self.charge_samples.clear()
+                self.charge_targets.clear()
+                self.charge_render_samples.clear()
+                self.charge_observed_at = None
+                self.charge_pending_change = None
+                self.charge_has_duplicates = False
+        if not self.charge_targets or sample_time > self.charge_targets[-1][0]:
+            self.charge_targets.append((sample_time, track.zone_angle, track.zone_size,
+                                        track.center, track.outline_radius, track.region))
+
+    def _timed_charge_action(self, track, velocity, sample_time, now):
+        """Allow a short, bounded entry prediction only after reliable tracking.
+
+        The entire dispatch-to-input-delay interval must fit inside Perfect.
+        These monotonic deadlines are rechecked by the app and input backend.
+        """
+        self.charge_timing_reliable = False
+        if not all(math.isfinite(value) for value in (track.marker, track.zone_angle,
+                track.zone_size, track.confidence, velocity, sample_time, now)):
+            return None
+        if (len(self.charge_samples) < 4 or len(self.charge_targets) < 3
+                or not track.zone_observed or track.confidence < 0.85
+                or now - sample_time > 0.025):
+            return None
+        # Even when every capture changes, the rendered position may have
+        # appeared before its first-seen timestamp. Bound that phase for all
+        # streams; no-duplicate tracking does not justify an exact-time fit.
+        return self._timed_render_action(track, velocity, sample_time, now)
+
+    def _timed_render_action(self, track, velocity, sample_time, now):
+        """Bound asynchronous render timing rather than fitting first-seen jitter.
+
+        Each changed position has an appearance-time interval. A constant speed
+        must be compatible with every interval; the safe click window uses the
+        complete resulting speed/position envelope, including centroid noise.
+        """
+        samples = list(self.charge_render_samples)
+        if len(samples) < 3 or not 0.25 <= abs(velocity) <= 40:
+            return None
+        self.charge_timing_reliable = True
+        latest_seen = samples[-1][1]
+        if not 0.016 <= latest_seen - samples[0][1] <= 0.25 or now - latest_seen > 0.025:
+            return None
+        direction = 1 if velocity > 0 else -1
+        transformed = [(low, high, position * direction) for low, high, position in samples]
+        centroid_noise = .003
+        minimum_speed, maximum_speed = .25, 40.0
+        for index, (low_i, high_i, position_i) in enumerate(transformed):
+            for low_j, high_j, position_j in transformed[index + 1:]:
+                delta = position_j - position_i
+                widest_interval = high_j - low_i
+                narrowest_interval = low_j - high_i
+                if widest_interval <= 0 or delta < -2 * centroid_noise:
+                    return None
+                minimum_speed = max(minimum_speed, (delta - 2 * centroid_noise) / widest_interval)
+                if narrowest_interval > 0:
+                    maximum_speed = min(maximum_speed, (delta + 2 * centroid_noise) / narrowest_interval)
+        if (minimum_speed > maximum_speed
+                or maximum_speed - minimum_speed > max(.75, abs(velocity) * .35)):
+            return None
+        target_error = max(abs((item[1] - track.zone_angle + math.pi) % math.tau - math.pi)
+                           for item in self.charge_targets)
+        half_zone = track.zone_size * .45 - target_error - maximum_speed * .0015
+        if half_zone <= 0:
+            return None
+        last_position = samples[-1][2]
+        center = last_position + (track.zone_angle - last_position + math.pi) % math.tau - math.pi
+        center *= direction
+        # The feasible constant-speed models form a convex polygon in
+        # (speed, position-at-latest-capture). Checking its vertices bounds
+        # every model, retaining the correlation between speed and position.
+        # Separate min/max speed envelopes would lose that correlation and
+        # unnecessarily miss a quantized 60 Hz target captured at 240 Hz.
+        lower_lines = [(position - centroid_noise, latest_seen - high)
+                       for low, high, position in transformed]
+        upper_lines = [(position + centroid_noise, latest_seen - low)
+                       for low, high, position in transformed]
+        lines = lower_lines + upper_lines
+        candidate_speeds = {minimum_speed, maximum_speed}
+        for index, (intercept_i, slope_i) in enumerate(lines):
+            for intercept_j, slope_j in lines[index + 1:]:
+                difference = slope_i - slope_j
+                if abs(difference) > 1e-12:
+                    crossing = (intercept_j - intercept_i) / difference
+                    if minimum_speed <= crossing <= maximum_speed:
+                        candidate_speeds.add(crossing)
+        vertices = []
+        for speed in candidate_speeds:
+            lowest = max(intercept + slope * speed for intercept, slope in lower_lines)
+            highest = min(intercept + slope * speed for intercept, slope in upper_lines)
+            if lowest <= highest + 1e-10:
+                vertices.extend(((speed, lowest), (speed, highest)))
+        if not vertices:
+            return None
+        # Every feasible marker must already be green at dispatch and still
+        # green when the configured input delay has elapsed.
+        entry = latest_seen + max((center - half_zone - position) / speed
+                                  for speed, position in vertices)
+        exit_time = latest_seen + min((center + half_zone - position) / speed
+                                      for speed, position in vertices)
+        delay = self._setting("input_latency", .008, 0, .12)
+        not_before = max(now, entry)
+        expires_at = min(exit_time - delay, latest_seen + .025, sample_time + .025)
+        if not_before > expires_at or not_before - now > .030:
+            return None
+        return Action("tap", not_before=not_before,
+                      execute_at=(not_before + expires_at) / 2, expires_at=expires_at)
 
     def _caught(self, now):
         self.caught += 1
@@ -435,12 +641,14 @@ class Engine:
                 self.previous_charge = None
                 self.charge_speeds.clear()
             circular = track.axis == "angle"
+            if circular:
+                self._observe_charge_target(track, sample_time)
             velocity = self._charge_velocity(track.marker, sample_time, circular)
             if circular:
                 actual_delta = (track.marker - track.zone_angle + math.pi) % math.tau - math.pi
                 half_zone = track.zone_size * 0.45
                 observed_inside = abs(actual_delta) <= half_zone
-                # The marker must already be visibly inside narrow Perfect.
+                # Without a reliable multi-frame model, require visible overlap.
                 # Account for capture age and the configured input delay so
                 # an observed late-edge overlap cannot land in broad green.
                 # Keep the projected delta unwrapped: a full revolution must
@@ -464,8 +672,32 @@ class Engine:
             else:
                 self.status = "Ring: white pointer outside Perfect"
             self.last_seen = now
-            # Never fire a timed click from an abnormally old captured frame.
-            if inside and frame_age <= 0.025:
+            if circular and self.config.get("charge_action", "click") != "release":
+                timed = self._timed_charge_action(track, velocity, sample_time, now)
+                if timed is not None:
+                    self._enter("transition", now, 1.5 + timed.execute_at - now)
+                    self.previous_charge = None
+                    self.charge_speeds.clear()
+                    self.status = "Ring: timing a click inside Perfect"
+                    return [timed]
+                if self.charge_timing_reliable:
+                    # A reliable model with no safe deadline must not fall
+                    # back to an unbounded immediate tap during preflight.
+                    if inside:
+                        self.status = "Ring: timing window uncertain — reading again"
+                    inside = False
+            # A fresh capture of a known duplicate rendered frame does not make
+            # that pointer position fresh again when its timing model expires.
+            pointer_age = frame_age
+            if circular and self.previous_charge is not None:
+                last_position, first_seen = self.previous_charge
+                repeated_delta = (track.marker - last_position + math.pi) % math.tau - math.pi
+                if abs(repeated_delta) < 0.003:
+                    pointer_age = max(pointer_age, now - first_seen)
+            if inside and pointer_age > 0.025:
+                self.status = "Ring: rendered pointer frame too old — reading again"
+            # Never fire from an abnormally old captured or rendered frame.
+            if inside and pointer_age <= 0.025:
                 self._enter("transition", now, 1.5)
                 self.previous_charge = None
                 self.charge_speeds.clear()
