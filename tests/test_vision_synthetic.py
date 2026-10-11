@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 
 from shrooms_macro.engine import Engine
-from shrooms_macro.vision import Detector
+from shrooms_macro.vision import Detector, TargetTrack, TuneTrack
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -212,20 +212,143 @@ class SyntheticRingTests(unittest.TestCase):
                                               captured_at=now)
                         self.assertEqual([action.kind for action in actions], [expected])
 
-    def test_local_discovery_does_not_select_a_distant_ring_or_colored_scenery(self):
+    def test_full_client_discovery_selects_a_verified_distant_ring_over_colored_scenery(self):
         config = self.outline_clipped_config(self.config, (1074.0, 555.0), 93.0)
         for height in (540, 720, 1080, 1440, 2160):
             with self.subTest(height=height):
-                # A real-looking ring elsewhere in the scene must not become
-                # the gameplay target, even with green/white scenery nearby.
+                # A moved, fully verified ring is found despite unrelated
+                # green and white scenery near the old calibration rectangle.
                 frame = ring_frame(0.0, 0.0, center=(300.0, 250.0))
                 cv2.rectangle(frame, (1080, 520), (1120, 570), (0, 255, 0), -1)
                 cv2.circle(frame, (1140, 555), 10, (255, 255, 255), -1)
                 if height != 1080:
                     frame = cv2.resize(frame, (round(1920 * height / 1080), height))
                 observation = Detector(config.copy(), ROOT / "assets").analyze(frame, 1)
-                self.assertFalse(observation.ring_present)
+                self.assertTrue(observation.ring_present)
+                self.assertIsNotNone(observation.charge)
+                scale = height / 1080
+                self.assertAlmostEqual(observation.charge.center[0], 300 * scale, delta=4 * scale)
+                self.assertAlmostEqual(observation.charge.center[1], 250 * scale, delta=4 * scale)
+                self.assertTrue(observation.charge.marker_overlap)
+
+    def test_remote_corners_are_reacquired_and_current_overlap_is_tracked(self):
+        for center in ((180.0, 170.0), (1740.0, 170.0), (180.0, 880.0), (1740.0, 880.0)):
+            for height in (540, 720, 1080, 1440, 2160):
+                with self.subTest(center=center, height=height):
+                    detector = Detector(self.config.copy(), ROOT / "assets")
+                    for index, (angle, expected) in enumerate(((math.pi, "up"), (0.0, "tap"))):
+                        frame = ring_frame(angle, height=height, center=center)
+                        now = 1 + index * 0.02
+                        observation = detector.analyze(frame, now)
+                        self.assertTrue(observation.ring_present)
+                        self.assertIsNotNone(observation.charge)
+                        scale = height / 1080
+                        self.assertAlmostEqual(observation.charge.center[0], center[0] * scale, delta=4 * scale)
+                        self.assertAlmostEqual(observation.charge.center[1], center[1] * scale, delta=4 * scale)
+                        self.assertEqual(observation.charge.marker_overlap, expected == "tap")
+                        engine = Engine(self.config.copy())
+                        engine.start(0)
+                        actions = engine.step(observation, frame.shape, now + 0.004, captured_at=now)
+                        self.assertEqual([action.kind for action in actions], [expected])
+
+    def test_far_movement_replaces_geometry_and_recovered_fast_path_uses_no_hough(self):
+        detector = Detector(self.config.copy(), ROOT / "assets")
+        initial = detector.analyze(ring_frame(math.pi), 1)
+        self.assertIsNotNone(initial.charge)
+        for index, center in enumerate(((180.0, 170.0), (1740.0, 880.0))):
+            now = 1.35 + index * 0.35
+            observation = detector.analyze(ring_frame(math.pi, center=center), now)
+            self.assertIsNotNone(observation.charge)
+            self.assertAlmostEqual(observation.charge.center[0], center[0], delta=4)
+            self.assertAlmostEqual(observation.charge.center[1], center[1], delta=4)
+            with patch("shrooms_macro.vision.cv2.HoughCircles", side_effect=AssertionError("Cached valid geometry must stay fast")):
+                overlap = detector.analyze(ring_frame(0.0, center=center), now + 0.02)
+            self.assertIsNotNone(overlap.charge)
+            self.assertTrue(overlap.charge.marker_overlap)
+
+    def test_remote_cache_is_invalidated_on_resize_and_absence(self):
+        detector = Detector(self.config.copy(), ROOT / "assets")
+        center = (1740.0, 170.0)
+        for index, height in enumerate((1080, 540, 2160, 720)):
+            with self.subTest(height=height):
+                observation = detector.analyze(ring_frame(math.pi, height=height, center=center), 1 + index * 0.02)
+                self.assertIsNotNone(observation.charge)
+                scale = height / 1080
+                self.assertAlmostEqual(observation.charge.center[0], center[0] * scale, delta=4 * scale)
+                self.assertAlmostEqual(observation.charge.center[1], center[1] * scale, delta=4 * scale)
+        blank = np.full((720, 1280, 3), (60, 120, 90), dtype=np.uint8)
+        absent = detector.analyze(blank, 1.5)
+        self.assertIsNone(absent.charge)
+        self.assertFalse(absent.ring_present)
+        self.assertIsNone(detector._ring_recovered_region)
+        self.assertIsNone(detector._ring_geometry)
+        self.assertIsNone(detector._ring_zone)
+
+    def test_green_white_scenery_and_broad_green_ring_cannot_authorize_a_track(self):
+        for background in ("scenery", "broad_ring"):
+            with self.subTest(background=background):
+                frame = np.full((1080, 1920, 3), (60, 120, 90), dtype=np.uint8)
+                if background == "scenery":
+                    cv2.rectangle(frame, (150, 140), (180, 180), (0, 255, 0), -1)
+                    cv2.circle(frame, (250, 170), 8, (255, 255, 255), -1)
+                    cv2.circle(frame, (1740, 880), 90, (0, 255, 0), -1)
+                    cv2.rectangle(frame, (1650, 870), (1670, 885), (255, 255, 255), -1)
+                else:
+                    frame = ring_frame(math.pi, center=(180.0, 170.0), target=False)
+                    yy, xx = np.indices(frame.shape[:2])
+                    radius = np.hypot(xx - 180, yy - 170)
+                    angle = np.arctan2(yy - 170, xx - 180)
+                    frame[(radius >= 93 * 0.73) & (radius <= 93) & (np.abs(angle) < 0.8)] = (0, 255, 0)
+                observation = Detector(self.config.copy(), ROOT / "assets").analyze(frame, 1)
                 self.assertIsNone(observation.charge)
+
+    def test_full_search_is_throttled_and_hough_never_scans_the_full_client(self):
+        detector = Detector(self.config.copy(), ROOT / "assets")
+        frame = np.full((1080, 1920, 3), (60, 120, 90), dtype=np.uint8)
+        detector.analyze(frame, 1)
+        detector.analyze(frame, 1.02)
+        self.assertEqual(detector._last_full_ring_search[2], 1)
+        detector.analyze(frame, 1.35)
+        self.assertEqual(detector._last_full_ring_search[2], 1.35)
+        original_hough = cv2.HoughCircles
+
+        def bounded_hough(image, *args, **kwargs):
+            self.assertLess(image.shape[0] * image.shape[1], frame.shape[0] * frame.shape[1] / 4)
+            return original_hough(image, *args, **kwargs)
+
+        with patch("shrooms_macro.vision.cv2.HoughCircles", side_effect=bounded_hough):
+            moved = detector.analyze(ring_frame(math.pi, center=(1740.0, 880.0)), 1.7)
+        self.assertIsNotNone(moved.charge)
+
+    def test_two_distinct_fully_verified_remote_controls_are_ambiguous(self):
+        frame = ring_frame(math.pi, center=(180.0, 170.0))
+        second = ring_frame(math.pi, center=(1740.0, 880.0))
+        frame[740:1020, 1600:1880] = second[740:1020, 1600:1880]
+        detector = Detector(self.config.copy(), ROOT / "assets")
+        observed = detector.analyze(frame, 1)
+        self.assertIsNone(observed.charge)
+        self.assertIsNone(detector._ring_recovered_region)
+
+    def test_recognized_tuning_or_catch_controls_skip_full_ring_reacquisition(self):
+        # A plausible old outline without a pointer must not make global
+        # recovery interrupt a later minigame already recognized this frame.
+        frame = ring_frame(math.pi, pointer=False)
+        for mode in ("tuning", "catch"):
+            with self.subTest(mode=mode):
+                detector = Detector(self.config.copy(), ROOT / "assets")
+                tuning = TuneTrack(900, 850, (400, 650, 1050, 300), 0.9, 840) if mode == "tuning" else None
+                frequency = TargetTrack(900, 850, 0.9, (400, 800, 1050, 150))
+                with patch.object(detector, "_reacquire_ring", side_effect=AssertionError("Other minigames must stay fast")):
+                    with patch.object(detector, "_tuning", return_value=tuning), \
+                         patch.object(detector, "_progress", return_value=0.5), \
+                         patch.object(detector, "_catch_presence", return_value=True), \
+                         patch.object(detector, "_catching", return_value=frequency):
+                        observed = detector.analyze(frame, 1)
+                if mode == "tuning":
+                    self.assertIs(observed.tuning, tuning)
+                else:
+                    self.assertTrue(observed.catch_present)
+                    self.assertIs(observed.frequency, frequency)
 
     def test_locally_discovered_outline_without_markers_cannot_authorize_a_click(self):
         config = self.outline_clipped_config(self.config, (1074.0, 555.0), 93.0)
@@ -291,6 +414,29 @@ class SyntheticSaleTests(unittest.TestCase):
         refreshed = detector.analyze(self.frame, 10.25)
         self.assertIsNotNone(refreshed.sell)
         self.assertIsNotNone(refreshed.confirm)
+
+    def test_manual_sale_mode_requires_no_sale_template_but_keeps_tuning_setup(self):
+        self.config["auto_sell"] = False
+        with tempfile.TemporaryDirectory() as directory:
+            assets = Path(directory)
+            self.assertTrue(cv2.imwrite(str(assets / "tune_prompt.png"), self.button))
+            detector = Detector(self.config, assets)
+            self.assertEqual(detector.ready(), [])
+            self.config["auto_sell"] = True
+            self.assertIn("Sell All template is missing", detector.ready())
+            self.config["auto_sell"] = False
+            detector.templates.pop("tune_prompt")
+            with patch.object(detector, "_refresh_templates"):
+                self.assertIn("Tuning prompt template is missing", detector.ready())
+
+    def test_manual_sale_mode_observes_inventory_without_confirmation_matching(self):
+        self.config["auto_sell"] = False
+        detector = Detector(self.config, self.assets)
+        with patch.object(detector, "_match", wraps=detector._match) as match:
+            observed = detector.analyze(self.frame, 10)
+        self.assertIsNotNone(observed.sell)
+        self.assertIsNone(observed.confirm)
+        self.assertNotIn("confirm", [call.args[1] for call in match.call_args_list])
 
 
 if __name__ == "__main__":

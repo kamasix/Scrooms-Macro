@@ -4,7 +4,7 @@ A small Windows desktop macro for SCROOMS. It reads the visible Roblox window an
 
 ## Download and use
 
-Download `ShroomsMacro-1.0.8.exe` from [Releases](https://github.com/kamasix/Scrooms-Macro/releases). Place it in a writable folder and run it; Python is not required for the EXE.
+Download `ShroomsMacro-1.0.9.exe` from [Releases](https://github.com/kamasix/Scrooms-Macro/releases). Place it in a writable folder and run it; Python is not required for the EXE.
 
 1. Open SCROOMS in Roblox, stand where you want to catch, and equip your instrument.
 2. Select the Roblox window in the macro. Refresh the list if necessary.
@@ -13,15 +13,17 @@ Download `ShroomsMacro-1.0.8.exe` from [Releases](https://github.com/kamasix/Scr
 
 The window starts near the upper-left corner and can be dragged. Settings stay collapsed until needed.
 
+Use **Auto sell** below Start/Stop to enable or disable selling. Turning it off keeps catching without inventory keys or sale clicks, preserves the saved sale interval, and shows the catch count without a sale threshold. Changing settings pauses the macro; press **F6** to resume.
+
 Use **Join Discord** at the bottom of the window or [join the community here](https://discord.gg/rrcTR6pNnC). Opening the link pauses the macro and launches your browser.
 
 ## What it does
 
 - Detects the rotating white pointer and narrow green **Perfect** segment. A click requires an observed overlap in a fresh frame and an estimated arrival that stays inside Perfect after input latency.
-- Searches a limited neighborhood when a saved calibration clips too much of the ring to recognize its outline, then keeps the verified complete ring region while it stays visible.
-- Matches Frequency and follows the moving catch field: **hold left mouse to move right; release to move left**.
+- Recovers a moved ring anywhere in the visible game window through a throttled search, then tracks its verified region. Saved calibration remains the first search location.
+- Matches Frequency and follows the moving catch field: **hold left mouse to move right; release to move left**. Measured relative velocity helps brake before overshooting the target and keep the dot near its middle while the target moves.
 - Keeps the physical cursor still during minigames. Selling is the only stage that moves it to a detected button.
-- After each detected catch by default, presses the backtick/tilde key, detects **Sell All**, clicks it twice using fresh button detections, then presses backtick/tilde again to close inventory. The catch interval is adjustable in Settings.
+- When Auto sell is enabled, after each detected catch by default, presses the backtick/tilde key, detects **Sell All**, clicks it twice using fresh button detections, then presses backtick/tilde again to close inventory. The catch interval is adjustable in Settings.
 - Waits 2.5 seconds after a detected catch for the result animation, then starts the sale. A persistent success label cannot block a sale that is due.
 - Moves smoothly to sale buttons, lets the hover position settle, then holds the click for up to 80 ms. Inventory uses a physical backtick key press held for up to 100 ms. Stop interrupts movement, waits, and presses and releases owned inputs.
 - Pauses if Roblox loses focus, a control cannot be detected, or a stage times out. It preserves the catch count if it cannot find the sell button.
@@ -33,6 +35,8 @@ When upgrading from 1.0.5, the old default sale interval of 10 changes to 1. Cus
 ## Calibration
 
 The default regions come from a widescreen layout and scale with the selected game's client area. Windows DPI and monitor offsets are handled in physical pixels, including monitors to the left of the primary display. Other aspect ratios, moved UI, or game updates can still require calibration.
+
+Ring recovery searches only the selected game window and verifies the circle, narrow green segment, and white pointer at full resolution before tracking the new region. It does not change the saved calibration. Other minigame regions still use their saved calibration.
 
 Open **Settings & calibration**, choose the relevant element, then show it in Roblox during the three-second countdown. Select it in the frozen image and press Enter to save or Escape to cancel. Use **Preview** to inspect recognition. **Diagnostics** saves images and recognition details locally; review and crop them before sharing.
 

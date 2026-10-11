@@ -568,6 +568,7 @@ class TapControllerTests(unittest.TestCase):
         app.desktop = MagicMock()
         app.ui = MagicMock()
         app.target_label = "Roblox"
+        app.profile = SimpleNamespace(data={"auto_sell": True})
         app.input_cancel = threading.Event()
         app.active = threading.Event()
         app.active.set()
@@ -608,6 +609,7 @@ class InputCleanupControllerTests(unittest.TestCase):
         self.app.desktop.cursor_over.return_value = True
         self.app.target = 101
         self.app.target_label = "Mock game"
+        self.app.profile = SimpleNamespace(data={"auto_sell": True})
         self.app.pending_start = None
         self.app.generation = 4
         self.app.calibrating = False

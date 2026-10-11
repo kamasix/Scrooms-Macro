@@ -14,6 +14,101 @@ class Action:
     y: float = 0
 
 
+class _LinearMotion:
+    """Short measured history in pixels; repeated rendered frames retain speed."""
+
+    def __init__(self):
+        self.previous = None
+        self.last_sample = None
+        self.speeds = deque(maxlen=3)
+        self.changed = False
+        self.generation = 0
+
+    def reset(self, position=None, now=None):
+        self.previous = None if position is None else (position, now)
+        self.last_sample = now
+        self.speeds.clear()
+        self.changed = False
+        self.generation += 1
+
+    def speed(self, position, now, width):
+        self.changed = False
+        if not all(math.isfinite(value) for value in (position, now, width)) or width <= 0:
+            self.reset()
+            return 0.0
+        if (self.previous is None or self.last_sample is None
+                or now < self.last_sample or now - self.last_sample > 0.18):
+            self.reset(position, now)
+            return 0.0
+        old_position, old_time = self.previous
+        self.last_sample = now
+        dt = now - old_time
+        delta = position - old_position
+        if abs(delta) < max(0.75, width * 0.00075):
+            if dt > 0.10:
+                self.reset(position, now)
+                return 0.0
+        elif dt >= 0.004:
+            speed = delta / dt
+            # A recognition jump must not become momentum or braking lead.
+            if dt > 0.18 or abs(delta) > width * 0.25 or abs(speed) > width * 4:
+                self.reset(position, now)
+                return 0.0
+            if self.speeds and speed * self.speeds[-1] < 0:
+                # A measured reversal is more relevant than the old direction.
+                self.speeds.clear()
+            self.speeds.append(speed)
+            self.previous = (position, now)
+            self.changed = True
+        if not self.speeds:
+            return 0.0
+        ordered = sorted(self.speeds)
+        return ordered[len(ordered) // 2]
+
+
+class _ButtonResponse:
+    """Only shorten braking after observing an immediate input reversal."""
+
+    def __init__(self):
+        self.generation = None
+        self.pending = None
+        self.horizon_limit = None
+
+    def observe(self, history, speed, sample_time):
+        if self.generation != history.generation:
+            self.generation = history.generation
+            self.pending = None
+            self.horizon_limit = None
+        if not history.changed or self.pending is None:
+            return
+        switched_at, old_speed = self.pending
+        elapsed = sample_time - switched_at
+        if elapsed <= 0:
+            return
+        # A fresh same-direction sample is evidence of real coasting. Keep
+        # the configured brake horizon rather than assuming an instant flip.
+        if speed * old_speed > 0:
+            self.horizon_limit = None
+            self.pending = None
+        elif speed * old_speed < 0 and elapsed <= 0.06:
+            self.horizon_limit = max(0.002, min(0.03, elapsed * 0.5))
+            self.pending = None
+        elif elapsed > 0.06:
+            self.pending = None
+
+    def switched(self, was_held, held, speed, sample_time):
+        if held == was_held:
+            return
+        # Target motion cannot be mistaken for the dot's input response.
+        if (was_held and speed > 0) or (not was_held and speed < 0):
+            self.pending = (sample_time, speed)
+        else:
+            self.pending = None
+
+    def horizon(self, configured):
+        return configured if self.horizon_limit is None else min(configured, self.horizon_limit)
+
+
 class Engine:
     def __init__(self, config: dict):
         self.config = config
@@ -32,6 +127,7 @@ class Engine:
         self.charge_speeds = deque(maxlen=5)
         self.previous_control = None
         self.previous_target = None
+        self.linear_motion = {}
         self.tuning_held = False
         self.catch_held = False
         self.last_target_seen = 0.0
@@ -49,6 +145,7 @@ class Engine:
         self.last_progress = None
         self.previous_charge = self.previous_control = self.previous_target = None
         self.charge_speeds.clear()
+        self.linear_motion.clear()
         self.tuning_held = self.catch_held = False
         self.status = "Reading the game screen…"
 
@@ -60,9 +157,12 @@ class Engine:
         self.tuning_held = self.catch_held = False
         self.previous_charge = None
         self.charge_speeds.clear()
+        self.linear_motion.clear()
         self.cast_pending = False
 
     def _enter(self, phase: str, now: float, delay: float = 0):
+        if phase != self.phase:
+            self.linear_motion.clear()
         self.phase, self.phase_started, self.deadline = phase, now, now + delay
 
     @staticmethod
@@ -94,6 +194,66 @@ class Engine:
             held = False
         setattr(self, state_name, held)
         return Action("down" if held else "up")
+
+    def _steer_motion(self, control, target, width, sample_time, frame_age, state_name,
+                      *, left=None, right=None):
+        """Brake measured relative motion, retaining the button near the midpoint."""
+        if (frame_age > 0.12
+                or not all(math.isfinite(value) for value in (control, target, width))
+                or width <= 0):
+            self.linear_motion.clear()
+            setattr(self, state_name, False)
+            self.status = "Reading fresh positions before steering"
+            return Action("up")
+        mode = "catch" if state_name == "catch_held" else "tuning"
+        reference_width = self.linear_motion.get(mode + "_width")
+        if reference_width is not None and abs(reference_width - width) > 0.5:
+            # Captured pixels use a new scale after a resize or monitor move.
+            self.linear_motion.clear()
+        self.linear_motion[mode + "_width"] = width
+        known_bounds = (left is not None and right is not None
+                        and math.isfinite(left) and math.isfinite(right) and right > left)
+        if mode == "catch" and known_bounds:
+            target = (left + right) / 2.0
+        control_history = self.linear_motion.setdefault(mode + "_control", _LinearMotion())
+        target_history = self.linear_motion.setdefault(mode + "_target", _LinearMotion())
+        control_speed = control_history.speed(control, sample_time, width)
+        target_speed = target_history.speed(target, sample_time, width)
+        response = self.linear_motion.setdefault(mode + "_response", _ButtonResponse())
+        response.observe(control_history, control_speed, sample_time)
+        relative_speed = control_speed - target_speed
+        raw_error = target - control
+        was_held = getattr(self, state_name)
+        if mode == "catch":
+            deadband = max(3.0, width * self._setting("catch_deadband", 0.012, 0.001, 0.05))
+            if known_bounds:
+                field_width = right - left
+                deadband = min(deadband, max(2.0, field_width * 0.1))
+                # Outside the observed field, always move back into it.
+                if control < left:
+                    self.catch_held = True
+                    response.switched(was_held, True, control_speed, sample_time)
+                    return Action("down")
+                if control > right:
+                    self.catch_held = False
+                    response.switched(was_held, False, control_speed, sample_time)
+                    return Action("up")
+                horizon = response.horizon(self._setting("catch_prediction", 0.085, 0, 0.3)) + min(frame_age, 0.10)
+                lead_limit = min(width * 0.35, field_width * 0.45)
+                lead = max(-lead_limit, min(lead_limit, relative_speed * horizon))
+                error = raw_error - lead
+            else:
+                # No visual target width is available: do not invent a field.
+                error = raw_error
+        else:
+            deadband = max(2.0, width * self._setting("tuning_deadband", 0.004, 0.001, 0.03))
+            horizon = response.horizon(self._setting("tuning_prediction", 0.055, 0, 0.20)) + min(frame_age, 0.10)
+            lead_limit = min(width * 0.12, max(deadband * 12, width * 0.03))
+            lead = max(-lead_limit, min(lead_limit, relative_speed * horizon))
+            error = raw_error - lead
+        action = self._steer_button(error, deadband, state_name)
+        response.switched(was_held, getattr(self, state_name), control_speed, sample_time)
+        return action
 
     def _charge_velocity(self, position, sample_time, circular):
         """Repeated captures of one rendered frame must not erase its speed."""
@@ -147,9 +307,14 @@ class Engine:
                 and now - self.catch_started > 0.4 and now - self.last_success > 1):
             return self._caught(now)
 
+        auto_sell = bool(self.config.get("auto_sell", True))
+        if self.phase.startswith("sell") and not auto_sell:
+            self._enter("idle", now, 0.45)
+            self.status = "Automatic selling disabled"
+            return [Action("up")]
         if self.phase.startswith("sell"):
             return self._sell_step(obs, now)
-        sale_due = self.caught >= int(self.config.get("sell_every", 1))
+        sale_due = auto_sell and self.caught >= int(self.config.get("sell_every", 1))
         if self.phase == "cooldown":
             # Keep the result-animation delay, but a persistent confirmation
             # must not prevent the inventory key when a sale is already due.
@@ -190,29 +355,20 @@ class Engine:
             # The upper white dot is driven by LMB; the moving field is its goal.
             if track.control_x is None:
                 self.catch_held = False
+                self.linear_motion.clear()
                 self.status = "Looking for the white dot…"
                 return [Action("up")]
             control = track.control_x
-            target_speed = self._velocity(self.previous_target, track.x, sample_time)
-            control_speed = self._velocity(self.previous_control, control, sample_time)
-            self.previous_target = (track.x, sample_time)
-            self.previous_control = (control, sample_time)
             w = track.region[2]
-            prediction = self._setting("catch_prediction", 0.085, 0, 0.3) + min(frame_age, 0.10)
-            raw_error = track.x - control
             field_width = track.control_width
             known_width = field_width is not None and math.isfinite(field_width) and field_width > 0
-            lead_limit = min(w * 0.35, field_width * 0.25) if known_width else 0.0
-            lead = max(-lead_limit, min(lead_limit, prediction * (target_speed - control_speed)))
-            # Velocity estimates may brake inside the goal, but must never
-            # direct an outside dot away from the visible field.
-            error = raw_error if not known_width or abs(raw_error) >= field_width / 2 else raw_error + lead
-            deadband = max(3.0, w * self._setting("catch_deadband", 0.012, 0.001, 0.05))
-            if known_width:
-                deadband = min(deadband, max(2.0, field_width * 0.1))
+            left, right = track.goal_left, track.goal_right
+            if (left is None or right is None) and known_width:
+                left, right = track.x - field_width / 2.0, track.x + field_width / 2.0
             percent = f" · {int(track.progress * 100)}%" if track.progress is not None else ""
             self.status = "Keeping the dot inside the moving field" + percent
-            return [self._steer_button(error, deadband, "catch_held")]
+            return [self._steer_motion(control, track.x, w, sample_time, frame_age,
+                                       "catch_held", left=left, right=right)]
 
         if self.phase == "catch":
             if getattr(obs, "catch_progress", None) is not None:
@@ -226,6 +382,7 @@ class Engine:
                     return [Action("up")]
                 if now - self.last_target_seen >= 0.16:
                     self.catch_held = False
+                    self.linear_motion.clear()
                     return [Action("up")]
                 return []
             # Short detector dropouts must not release the button or count a catch.
@@ -257,13 +414,10 @@ class Engine:
                 self.error = "Tuning timed out — check Preview and calibration."
                 return [Action("up")]
             w = track.region[2]
-            # Frequency tuning has a narrow target: never reverse direction
-            # before reaching it based on an assumed movement/inertia model.
-            error = track.target_x - track.marker_x
-            deadband = max(2.0, w * self._setting("tuning_deadband", 0.004, 0.001, 0.03))
             self.status = "Matching the frequency"
             self.last_seen = now
-            return [self._steer_button(error, deadband, "tuning_held")]
+            return [self._steer_motion(track.marker_x, track.target_x, w, sample_time,
+                                       frame_age, "tuning_held")]
 
         if getattr(obs, "ring_present", False):
             self.cast_pending = False
@@ -353,6 +507,9 @@ class Engine:
             return [Action("up")]
         if obs.sell is not None:
             self._enter("idle", now, 0.7)
+            if not auto_sell:
+                self.status = "Inventory visible — close it manually to continue"
+                return [Action("up")]
             self.status = "Closing the open inventory"
             return [Action("up"), Action("inventory")]
         if now >= self.deadline:

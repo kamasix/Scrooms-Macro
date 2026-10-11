@@ -91,6 +91,7 @@ class Application:
     def snapshot(self, warning=""):
         return {"running": self.active.is_set(), "status": self.engine.status,
                 "caught": self.engine.caught, "sold_batches": self.engine.sold_batches,
+                "auto_sell": self.profile.data.get("auto_sell", True),
                 "target": self.target_label,
                 "warning": warning or getattr(self, "input_release_warning", "") or self.engine.error}
 

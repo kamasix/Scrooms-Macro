@@ -86,6 +86,8 @@ class Profile:
         except (TypeError, ValueError, OverflowError):
             self.data["input_latency"] = 0.008
         self.data["frequency_axis"] = "x"
+        auto_sell = self.data.get("auto_sell", True)
+        self.data["auto_sell"] = auto_sell if isinstance(auto_sell, bool) else True
         self.data["always_on_top"] = bool(self.data.get("always_on_top", True))
 
     def save(self):

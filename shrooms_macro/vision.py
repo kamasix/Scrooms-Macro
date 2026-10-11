@@ -2,7 +2,8 @@
 
 All output coordinates are physical pixels relative to the captured client area.
 Regions in configuration are normalized ``[x, y, width, height]`` rectangles.
-No moving gameplay target is searched outside its configured gameplay region.
+Perfect can be reacquired elsewhere within the captured game client; other
+moving controls remain inside their configured gameplay regions.
 """
 
 from __future__ import annotations
@@ -212,6 +213,7 @@ class Detector:
         self._last_geometry_retry = -math.inf
         self._ring_recovered_region: tuple[tuple[int, int], Box, Box] | None = None
         self._last_local_ring_search: tuple[tuple[int, int], Box, float] | None = None
+        self._last_full_ring_search: tuple[tuple[int, int], Box, float] | None = None
         self._scan_cache: dict[str, tuple[float, Match | None]] = {}
         self._features: dict[tuple[Any, ...], np.ndarray] = {}
         self._refresh_templates(force=True)
@@ -265,7 +267,7 @@ class Detector:
         progress_crop, _ = crop_region(np.zeros((100, 100, 3), dtype=np.uint8), self.config.get("progress_region"))
         if "success" not in self.templates and progress_crop.size == 0:
             missing.append("Set the progress bar or a catch confirmation template")
-        if "sell" not in self.templates:
+        if self.config.get("auto_sell", True) and "sell" not in self.templates:
             missing.append("Sell All template is missing")
         return missing
 
@@ -410,7 +412,9 @@ class Detector:
         return float(ring[valid].mean())
 
     def _ring_outline(self, crop: np.ndarray, region: Box, *, force: bool = False,
-                      radius_reference: float | None = None) -> float | None:
+                      radius_reference: float | None = None,
+                      radius_bounds: tuple[float, float] | None = None,
+                      target_point: tuple[float, float] | None = None) -> float | None:
         _, _, w, h = region
         previous = self._ring_geometry
         self._ring_used_cached_geometry = False
@@ -422,15 +426,21 @@ class Detector:
                 return score
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
         reference = min(w, h) if radius_reference is None else radius_reference
+        minimum_radius, maximum_radius = (reference * 0.25, reference * 0.59) if radius_bounds is None else radius_bounds
+        hough_maximum = reference * 0.57 if radius_bounds is None else maximum_radius
         circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, 1.0, min(w, h) * 0.20,
-                                   param1=80, param2=25, minRadius=round(reference * 0.25), maxRadius=round(reference * 0.57))
+                                   param1=80, param2=25, minRadius=max(3, round(minimum_radius)), maxRadius=round(hough_maximum))
         best = None
         if circles is not None:
             for proposed in circles[0]:
                 cx, cy, proposed_radius = (float(v) for v in proposed)
                 for radius in (proposed_radius, proposed_radius / 0.75, proposed_radius * 0.75):
-                    if not reference * 0.25 <= radius <= reference * 0.59:
+                    if not minimum_radius <= radius <= maximum_radius:
                         continue
+                    if target_point is not None:
+                        target_distance = math.hypot(target_point[0] - cx, target_point[1] - cy)
+                        if not radius * 0.70 <= target_distance <= radius * 1.05:
+                            continue
                     score = self._outline_score(crop, cx, cy, radius)
                     if score >= 0.55 and (best is None or score > best[0]):
                         best = (score, cx, cy, radius)
@@ -523,6 +533,90 @@ class Detector:
         # Immediately return to a compact, cached ROI around the verified
         # circle. Normal frames do not repeat the wider fallback or Hough fit.
         return self._recover_ring_crop(frame, base_region, search_region, force=True)
+
+    def _reacquire_ring(self, frame: np.ndarray, base_region: Box, now: float) -> BarTrack | None:
+        """Reacquire a moved Perfect inside this client, without full-frame Hough.
+
+        A reduced image supplies compact green candidates. At most twelve
+        surrounding patches get a circle fit; a result is accepted only after
+        the normal original-pixel outline, green arc and white pointer checks.
+        """
+        dimensions = frame.shape[:2]
+        previous = self._last_full_ring_search
+        if (previous is not None and previous[:2] == (dimensions, base_region)
+                and 0 <= now - previous[2] < 0.30):
+            return None
+        self._last_full_ring_search = (dimensions, base_region, now)
+        height, width = dimensions
+        reduction = min(1.0, 540.0 / height, 1200.0 / width)
+        small = frame if reduction == 1 else cv2.resize(frame, (round(width * reduction), round(height * reduction)),
+                                                      interpolation=cv2.INTER_AREA)
+        small_height, small_width = small.shape[:2]
+        sx, sy = width / small_width, height / small_height
+        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+        green = cv2.inRange(hsv, np.array((50, 170, 190)), np.array((95, 255, 255)))
+        white = _white(small, 190) > 0
+        lime = (hsv[:, :, 0] >= 25) & (hsv[:, :, 0] <= 49) & (hsv[:, :, 1] >= 120) & (hsv[:, :, 2] >= 150)
+        shorter = min(small_height, small_width)
+        minimum_radius, maximum_radius = max(12.0, shorter * 0.035), shorter * 0.16
+        candidates = []
+        for box, area, gx, gy in _components(green, 5):
+            x, y, w, h = box
+            if area > shorter * shorter * 0.006 or max(w, h) > maximum_radius * 0.90:
+                continue
+            margin = math.ceil(maximum_radius * 2.15)
+            left, top = max(0, x - margin), max(0, y - margin)
+            right, bottom = min(small_width, x + w + margin), min(small_height, y + h + margin)
+            if np.count_nonzero(white[top:bottom, left:right]) < 6:
+                continue
+            nearby = math.ceil(maximum_radius * 0.45)
+            lime_count = np.count_nonzero(lime[max(0, y - nearby):min(small_height, y + h + nearby),
+                                              max(0, x - nearby):min(small_width, x + w + nearby)])
+            priority = min(6.0, lime_count / max(1, area)) + min(1.0, area / 80.0)
+            candidates.append((priority, (left, top, right - left, bottom - top), (gx - left, gy - top)))
+        candidates.sort(key=lambda candidate: candidate[0], reverse=True)
+        saved = (self._ring_geometry, self._ring_zone, self._ring_recovered_region,
+                 self._last_ring_present, self._last_ring_diagnostic, self._ring_used_cached_geometry)
+        found = None
+        found_state = None
+        for _, search_region, target_point in candidates[:12]:
+            x, y, w, h = search_region
+            self._ring_geometry = self._ring_zone = None
+            crop = small[y:y + h, x:x + w]
+            if self._ring_outline(crop, search_region, force=True,
+                                  radius_bounds=(minimum_radius, maximum_radius), target_point=target_point) is None:
+                continue
+            _, cx, cy, radius = self._ring_geometry
+            global_x, global_y = (x + cx) * sx, (y + cy) * sy
+            physical_radius = radius * (sx + sy) * 0.5
+            margin = physical_radius * 1.30 + 3.0
+            left, top = max(0, math.floor(global_x - margin)), max(0, math.floor(global_y - margin))
+            right, bottom = min(width, math.ceil(global_x + margin)), min(height, math.ceil(global_y + margin))
+            recovered = (left, top, right - left, bottom - top)
+            physical_crop = frame[top:bottom, left:right]
+            self._ring_geometry = (recovered, global_x - left, global_y - top, physical_radius)
+            # Refit against original pixels; reduced pixels never authorize an
+            # input or create a remembered angular Perfect target.
+            if self._ring_outline(physical_crop, recovered, force=True) is None:
+                continue
+            track = self._ring(physical_crop, recovered, now)
+            if track is None or not track.zone_observed:
+                continue
+            state = (self._ring_geometry, self._ring_zone,
+                     (dimensions, base_region, recovered), True, "", self._ring_used_cached_geometry)
+            if found is not None:
+                same_circle = (math.dist(found.center, track.center) <= max(4.0, track.outline_radius * 0.12)
+                               and abs(found.outline_radius - track.outline_radius) <= track.outline_radius * 0.10)
+                if not same_circle:
+                    # Two fully qualifying controls are ambiguous. Keep the
+                    # local observation instead of choosing an arbitrary ring.
+                    found = found_state = None
+                    break
+            else:
+                found, found_state = track, state
+        (self._ring_geometry, self._ring_zone, self._ring_recovered_region,
+         self._last_ring_present, self._last_ring_diagnostic, self._ring_used_cached_geometry) = found_state or saved
+        return found
 
     def _ring(self, crop: np.ndarray, region: Box, now: float | None = None) -> BarTrack | None:
         now = time.monotonic() if now is None else now
@@ -828,13 +922,15 @@ class Detector:
         _, cx, cy = max(candidates)
         return cx, cy
 
-    def _catching(self, frame: np.ndarray, now: float) -> TargetTrack | None:
+    def _catching(self, frame: np.ndarray, now: float, *, progress: float | None = None,
+                  verified_presence: bool = False) -> TargetTrack | None:
         crop, region = crop_region(frame, self.config.get("frequency_region"))
         if crop.size == 0 or min(crop.shape[:2]) < 15:
             return None
-        progress = self._progress(frame)
-        if progress is None or not self._catch_presence(frame, progress):
-            return None
+        if not verified_presence:
+            progress = self._progress(frame)
+            if progress is None or not self._catch_presence(frame, progress):
+                return None
         limits = self._catch_bar_limits(crop)
         if limits is None:
             return None
@@ -916,21 +1012,31 @@ class Detector:
             # Ring timing is sensitive to frame rate. No inventory/text scans
             # can change the charge action, so keep this fast path minimal.
             return Observation(charge=charge, ring_present=self._last_ring_present)
-        if self._last_ring_present:
-            return Observation(ring_present=True, ring_diagnostic=self._last_ring_diagnostic)
-        tuning = None if charge is not None else self._tuning(frame, now)
+        # Active tuning and catching controls must keep their regular cheap
+        # path, even if scenery resembles a ring at the old charge position.
+        # Full-client reacquisition runs only when neither other UI is present.
+        tuning = self._tuning(frame, now)
         if tuning is not None:
             return Observation(tuning=tuning)
-        frequency = None if charge is not None or tuning is not None else self._catching(frame, now)
-        progress = None if charge is not None or tuning is not None else self._progress(frame)
-        catch_present = charge is None and tuning is None and self._catch_presence(frame, progress)
+        progress = self._progress(frame)
+        catch_present = self._catch_presence(frame, progress)
+        frequency = None
         if catch_present:
+            frequency = self._catching(frame, now, progress=progress, verified_presence=True)
             return Observation(frequency=frequency, catch_present=True, catch_progress=progress)
+        if shape == "ring" and charge_crop.size:
+            charge = self._reacquire_ring(frame, base_charge_region, now)
+            if charge is not None:
+                return Observation(charge=charge, ring_present=True)
+        if self._last_ring_present:
+            return Observation(ring_present=True, ring_diagnostic=self._last_ring_diagnostic)
         # Catch notification samples are user-provided. Never infer a catch from
         # the word Perfect while the starting minigame is still on screen.
         success = charge is None and self._match(frame, "success", now) is not None
+        # A visible inventory still pauses instrument input in manual sale
+        # mode. Its confirmation button has no purpose while sale is disabled.
         sell = self._match(frame, "sell", now)
-        confirm = self._match(frame, "confirm", now)
+        confirm = self._match(frame, "confirm", now) if self.config.get("auto_sell", True) else None
         return Observation(charge, frequency, success, sell, confirm, tuning, catch_present, progress if catch_present else None)
 
     @staticmethod

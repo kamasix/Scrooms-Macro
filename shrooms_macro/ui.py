@@ -25,8 +25,10 @@ class MacroUI:
     def __init__(self, root: tk.Tk, callbacks: dict, initial: dict) -> None:
         self.root = root
         self.callbacks: dict[str, Callable[..., Any]] = callbacks
-        self.initial = initial or {}
+        # Keep edits local until the controller has stopped the worker safely.
+        self.initial = dict(initial or {})
         self.running = False
+        self._caught = 0
         self._advanced_open = False
         self._selected_hwnd: int | None = None
         self._window_choices: dict[str, int] = {}
@@ -42,11 +44,12 @@ class MacroUI:
 
         self.status_var = tk.StringVar(value="Ready")
         self.target_var = tk.StringVar(value="")
-        self.count_var = tk.StringVar(value=f"0 / {self._sell_every()}")
+        self.count_var = tk.StringVar(value="")
         self.sold_var = tk.StringVar(value="Sale cycles: 0")
         self.warning_var = tk.StringVar(value="")
         self.window_var = tk.StringVar(value="Select game window…")
         self.sell_every_var = tk.StringVar(value=str(self._sell_every()))
+        self.auto_sell_var = tk.BooleanVar(value=bool(self.initial.get("auto_sell", True)))
         self.perfect_ms_var = tk.StringVar(value=str(self._perfect_ms()))
         self.topmost_var = tk.BooleanVar(value=bool(self.initial.get("always_on_top", True)))
 
@@ -58,6 +61,7 @@ class MacroUI:
         self._build_controls(content)
         self._build_window_choice(content)
         self._build_advanced(content)
+        self._sync_sell_controls()
 
         self.warning_label = tk.Label(
             content, textvariable=self.warning_var, bg=self.BG,
@@ -158,11 +162,19 @@ class MacroUI:
 
     def _build_controls(self, parent: tk.Widget) -> None:
         row = tk.Frame(parent, bg=self.BG)
-        row.pack(fill="x", pady=(12, 12))
+        row.pack(fill="x", pady=(12, 5))
         self.start_button = self._button(row, "▶  Start", lambda: self._call("toggle"), primary=True)
         self.start_button.pack(side="left", fill="x", expand=True)
         self.stop_button = self._button(row, "■  Stop", lambda: self._call("stop"))
         self.stop_button.pack(side="left", padx=(8, 0))
+        self.auto_sell_check = tk.Checkbutton(
+            parent, text="Auto sell", variable=self.auto_sell_var,
+            command=self._save_settings, bg=self.BG, fg=self.TEXT,
+            activebackground=self.BG, activeforeground=self.TEXT,
+            selectcolor=self.FIELD, relief="flat", font=("Segoe UI", 9),
+            anchor="w", cursor="hand2", highlightthickness=0,
+        )
+        self.auto_sell_check.pack(fill="x", pady=(0, 9))
 
     def _build_window_choice(self, parent: tk.Widget) -> None:
         self._label(parent, "GAME WINDOW", fg=self.MUTED, font=("Segoe UI", 8, "bold"), anchor="w").pack(fill="x", pady=(0, 5))
@@ -208,6 +220,7 @@ class MacroUI:
         self.sell_spin = tk.Spinbox(
             settings_row, from_=1, to=999, width=4, textvariable=self.sell_every_var,
             bg=self.FIELD, fg=self.TEXT, insertbackground=self.TEXT,
+            disabledbackground=self.FIELD, disabledforeground=self.MUTED,
             buttonbackground=self.FIELD, relief="flat", highlightthickness=1,
             highlightbackground=self.BORDER, highlightcolor=self.GREEN,
             font=("Segoe UI", 9), command=self._save_settings,
@@ -311,6 +324,13 @@ class MacroUI:
         except (TypeError, ValueError, OverflowError):
             return 8
 
+    def _sync_sell_controls(self) -> None:
+        enabled = bool(self.auto_sell_var.get())
+        self.sell_spin.configure(state="normal" if enabled else "disabled")
+        self.count_var.set(
+            f"{self._caught} / {self._sell_every()}" if enabled else str(self._caught)
+        )
+
     def _call(self, name: str, *args: Any) -> Any:
         callback = self.callbacks.get(name)
         if callback is None:
@@ -366,11 +386,13 @@ class MacroUI:
             perfect_ms = self._perfect_ms()
         self.perfect_ms_var.set(str(perfect_ms))
         settings = {
+            "auto_sell": bool(self.auto_sell_var.get()),
             "sell_every": sell_every,
             "input_latency": perfect_ms / 1000,
             "always_on_top": bool(self.topmost_var.get()),
         }
         self.initial.update(settings)
+        self._sync_sell_controls()
         self.root.attributes("-topmost", settings["always_on_top"])
         self._call("settings", settings)
 
@@ -425,8 +447,13 @@ class MacroUI:
         if "target" in snapshot and str(snapshot["target"]) != self.target_var.get():
             self.target_var.set(str(snapshot["target"]))
             self._schedule_fit()
+        if "auto_sell" in snapshot:
+            self.initial["auto_sell"] = bool(snapshot["auto_sell"])
+            self.auto_sell_var.set(self.initial["auto_sell"])
         if "caught" in snapshot:
-            self.count_var.set(f"{snapshot['caught']} / {self._sell_every()}")
+            self._caught = snapshot["caught"]
+        if "auto_sell" in snapshot or "caught" in snapshot:
+            self._sync_sell_controls()
         if "sold_batches" in snapshot:
             self.sold_var.set(f"Sale cycles: {snapshot['sold_batches']}")
         if "warning" in snapshot and str(snapshot.get("warning") or "") != self.warning_var.get():

@@ -8,6 +8,7 @@
     "catch_target": [1919, 1079]
   },
   "sell_every": 1,
+  "auto_sell": true,
   "always_on_top": true,
   "frequency_axis": "x",
   "charge_action": "click",

@@ -36,6 +36,29 @@ class ProfileChecks(unittest.TestCase):
         self.assertEqual(profile.data["sell_every"], 1)
         self.assertEqual(profile.data["input_latency"], 0.008)
         self.assertEqual(profile.data["control_mode"], "hold_release")
+        self.assertTrue(profile.data["auto_sell"])
+
+    def test_auto_sell_choice_survives_save_and_reload_with_interval_and_count(self):
+        profile = self.profile({"profile_version": 3, "auto_sell": False,
+                                "sell_every": 10, "initial_caught": 7})
+        self.assertFalse(profile.data["auto_sell"])
+        profile.save()
+        reloaded = Profile(self.base)
+        self.assertFalse(reloaded.data["auto_sell"])
+        self.assertEqual(reloaded.data["sell_every"], 10)
+        self.assertEqual(reloaded.data["initial_caught"], 7)
+        reloaded.data["auto_sell"] = True
+        reloaded.save()
+        self.assertTrue(Profile(self.base).data["auto_sell"])
+
+    def test_older_profile_defaults_to_auto_sell_without_resetting_custom_settings(self):
+        region = [0.1, 0.2, 0.3, 0.4]
+        profile = self.profile({"profile_version": 3, "sell_every": 14,
+                                "initial_caught": 7, "charge_region": region})
+        self.assertTrue(profile.data["auto_sell"])
+        self.assertEqual(profile.data["sell_every"], 14)
+        self.assertEqual(profile.data["initial_caught"], 7)
+        self.assertEqual(profile.data["charge_region"], region)
 
     def test_v1_stock_release_migrates_without_resetting_authoring_or_counts(self):
         region = [0.1, 0.2, 0.3, 0.4]

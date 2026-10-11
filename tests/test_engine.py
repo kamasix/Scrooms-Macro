@@ -213,14 +213,190 @@ class EngineChecks(unittest.TestCase):
         inside = TargetTrack(900, 836, .95, region, 895, 40, 895, .3)
         self.assertEqual([a.kind for a in self.step(Observation(frequency=inside), 1.04)], ["up"])
 
-    def test_tuning_does_not_reverse_before_reaching_the_target(self):
+    def test_tuning_brakes_before_target_when_measured_momentum_would_overshoot(self):
         region = (425, 800, 1060, 150)
         first = TuneTrack(800, 700, region, .99, 836)
         second = TuneTrack(800, 770, region, .99, 836)
         self.assertEqual([a.kind for a in self.step(Observation(tuning=first), 1)], ["down"])
-        self.assertEqual([a.kind for a in self.step(Observation(tuning=second), 1.05)], ["down"])
+        # 70 px in 50 ms is measured rightward momentum. Release before the
+        # target so the pointer does not coast past it while input takes effect.
+        self.assertEqual([a.kind for a in self.step(Observation(tuning=second), 1.05)], ["up"])
         passed = TuneTrack(800, 810, region, .99, 836)
         self.assertEqual([a.kind for a in self.step(Observation(tuning=passed), 1.1)], ["up"])
+
+    def steering_catch(self, target, control, now, width=100, *, captured_at=None):
+        track = TargetTrack(target, 836, .95, (0, 800, 1000, 150), control,
+                            width, control, .4, target - width / 2,
+                            target + width / 2, 800, 950, 836)
+        return self.engine.step(Observation(frequency=track, catch_present=True),
+                                (1080, 1920, 3), now, captured_at=captured_at)
+
+    def test_catch_releases_before_right_edge_when_dot_has_rightward_momentum(self):
+        self.assertEqual([a.kind for a in self.steering_catch(500, 475, 1)], ["down"])
+        self.assertEqual([a.kind for a in self.steering_catch(500, 485, 1.02)], ["up"])
+
+    def test_catch_holds_before_left_edge_when_dot_has_leftward_momentum(self):
+        self.assertEqual([a.kind for a in self.steering_catch(500, 525, 1)], ["up"])
+        self.assertEqual([a.kind for a in self.steering_catch(500, 515, 1.02)], ["down"])
+
+    def test_catch_matches_moving_target_instead_of_only_global_dot_direction(self):
+        self.assertEqual([a.kind for a in self.steering_catch(500, 515, 1)], ["up"])
+        # Both move right, but the target moves faster. Holding lets the dot
+        # catch its moving center rather than braking global rightward motion.
+        self.assertEqual([a.kind for a in self.steering_catch(530, 525, 1.05)], ["down"])
+
+    def test_catch_duplicate_rendered_frame_retains_braking_until_motion_expires(self):
+        self.steering_catch(500, 475, 1)
+        self.assertEqual([a.kind for a in self.steering_catch(500, 485, 1.02)], ["up"])
+        self.assertEqual([a.kind for a in self.steering_catch(500, 485, 1.04)], ["up"])
+        # A long observation gap cannot retain that old rightward velocity.
+        self.assertEqual([a.kind for a in self.steering_catch(500, 485, 1.4)], ["down"])
+
+    def test_catch_recognition_jump_does_not_become_false_reverse_momentum(self):
+        self.steering_catch(500, 475, 1, width=1000)
+        self.assertEqual([a.kind for a in self.steering_catch(500, 900, 1.02, width=1000)], ["up"])
+        # Returning 405 px in 20 ms is another detection jump, not a reason
+        # to accelerate right while the fresh dot is already near the midpoint.
+        self.assertEqual([a.kind for a in self.steering_catch(500, 495, 1.04, width=1000)], ["up"])
+
+    def test_catch_stale_frame_releases_and_clears_steering_momentum(self):
+        self.steering_catch(500, 475, 1)
+        self.assertEqual([a.kind for a in self.steering_catch(500, 485, 1.25, captured_at=1.02)], ["up"])
+        self.assertEqual([a.kind for a in self.steering_catch(500, 485, 1.27)], ["down"])
+
+    def test_catch_uses_actual_edges_instead_of_inconsistent_reported_width(self):
+        track = TargetTrack(500, 836, .95, (0, 800, 1000, 150), 520,
+                            20, 520, .4, 450, 550, 800, 950, 836)
+        self.engine.catch_held = True
+        self.step(Observation(frequency=track, catch_present=True), 1)
+        self.assertEqual([a.kind for a in self.steering_catch(500, 510, 1.02)], ["down"])
+
+    def test_tuning_duplicate_frames_retain_braking_momentum(self):
+        region = (0, 800, 1000, 150)
+        self.step(Observation(tuning=TuneTrack(500, 480, region, .99, 836)), 1)
+        self.assertEqual([a.kind for a in self.step(Observation(tuning=TuneTrack(500, 490, region, .99, 836)), 1.025)], ["up"])
+        self.assertEqual([a.kind for a in self.step(Observation(tuning=TuneTrack(500, 490, region, .99, 836)), 1.04)], ["up"])
+
+    def test_centered_catch_brakes_observed_drift_in_either_direction(self):
+        for first, expected in ((490, "up"), (510, "down")):
+            self.engine.start(0)
+            self.steering_catch(500, first, 1)
+            actions = self.steering_catch(500, 500, 1.02)
+            self.assertEqual([a.kind for a in actions], [expected])
+
+    def test_centered_tuning_brakes_observed_drift_in_either_direction(self):
+        region = (0, 800, 1000, 150)
+        for first, expected in ((490, "up"), (510, "down")):
+            self.engine.start(0)
+            self.step(Observation(tuning=TuneTrack(500, first, region, .99, 836)), 1)
+            actions = self.step(Observation(tuning=TuneTrack(500, 500, region, .99, 836)), 1.025)
+            self.assertEqual([a.kind for a in actions], [expected])
+
+    def test_tuning_instant_reversal_does_not_stall_before_the_target(self):
+        # A control with no inertia must still reach the point target; fixed
+        # braking lead alone would shuttle between 480 and 486.7 indefinitely.
+        region = (0, 800, 1000, 150)
+        marker = 400.0
+        errors = []
+        for index in range(80):
+            actions = self.step(Observation(tuning=TuneTrack(500, marker, region, .99, 836)),
+                                1 + index / 60)
+            errors.append(abs(marker - 500))
+            marker += (400 if actions[0].kind == "down" else -400) / 60
+        self.assertLessEqual(min(errors), 4)
+        self.assertLessEqual(max(errors[-40:]), 14)
+
+    def test_tuning_coasting_after_release_keeps_early_braking(self):
+        region = (0, 800, 1000, 150)
+        for marker, now in ((470, 1), (480, 1.025), (490, 1.05)):
+            self.step(Observation(tuning=TuneTrack(500, marker, region, .99, 836)), now)
+        actions = self.step(Observation(tuning=TuneTrack(500, 495, region, .99, 836)), 1.075)
+        self.assertEqual([a.kind for a in actions], ["up"])
+        self.assertIsNone(self.engine.linear_motion["tuning_response"].horizon_limit)
+
+    def test_tuning_duplicate_capture_does_not_claim_an_instant_response(self):
+        region = (0, 800, 1000, 150)
+        for marker, now in ((480, 1), (490, 1.025), (490, 1.04)):
+            self.step(Observation(tuning=TuneTrack(500, marker, region, .99, 836)), now)
+        self.assertIsNone(self.engine.linear_motion["tuning_response"].horizon_limit)
+
+    def test_tuning_newly_observed_coasting_restores_the_default_braking_horizon(self):
+        region = (0, 800, 1000, 150)
+        for marker, now in ((480, 1), (490, 1.025), (480, 1.05),
+                            (490, 1.075), (500, 1.1)):
+            self.step(Observation(tuning=TuneTrack(500, marker, region, .99, 836)), now)
+        self.assertIsNotNone(self.engine.linear_motion["tuning_response"].horizon_limit)
+        # The dot keeps moving right in a fresh frame after release. It now
+        # demonstrates coasting, so the short no-inertia fallback must expire.
+        actions = self.step(Observation(tuning=TuneTrack(500, 505, region, .99, 836)), 1.125)
+        self.assertEqual([a.kind for a in actions], ["up"])
+        self.assertIsNone(self.engine.linear_motion["tuning_response"].horizon_limit)
+
+    def test_start_discards_previously_measured_immediate_button_response(self):
+        region = (0, 800, 1000, 150)
+        for marker, now in ((480, 1), (490, 1.025), (480, 1.05)):
+            self.step(Observation(tuning=TuneTrack(500, marker, region, .99, 836)), now)
+        self.assertIsNotNone(self.engine.linear_motion["tuning_response"].horizon_limit)
+        self.engine.start(1.1)
+        for marker, now in ((480, 1.12), (490, 1.145)):
+            actions = self.step(Observation(tuning=TuneTrack(500, marker, region, .99, 836)), now)
+        self.assertEqual([a.kind for a in actions], ["up"])
+        self.assertIsNone(self.engine.linear_motion["tuning_response"].horizon_limit)
+
+    def test_bar_resize_discards_catch_speed_and_response_in_old_pixel_scale(self):
+        self.steering_catch(500, 475, 1)
+        self.steering_catch(500, 485, 1.02)
+        track = TargetTrack(500, 836, .95, (0, 800, 2000, 150), 485,
+                            100, 485, .4, 450, 550, 800, 950, 836)
+        actions = self.step(Observation(frequency=track, catch_present=True), 1.04)
+        self.assertEqual([a.kind for a in actions], ["down"])
+        self.assertFalse(self.engine.linear_motion["catch_control"].speeds)
+        self.assertIsNone(self.engine.linear_motion["catch_response"].horizon_limit)
+
+    def test_bar_resize_discards_tuning_speed_and_response_in_old_pixel_scale(self):
+        for marker, now in ((480, 1), (490, 1.025)):
+            self.step(Observation(tuning=TuneTrack(500, marker, (0, 800, 1000, 150), .99, 836)), now)
+        actions = self.step(Observation(tuning=TuneTrack(500, 490, (0, 800, 2000, 150), .99, 836)), 1.04)
+        self.assertEqual([a.kind for a in actions], ["down"])
+        self.assertFalse(self.engine.linear_motion["tuning_control"].speeds)
+
+    def test_catch_target_velocity_uses_observed_edge_center(self):
+        # A separate legacy x value may jitter; actual visual edges define
+        # both the destination and its measured movement.
+        for reported, control, now in ((500, 490, 1), (540, 500, 1.02)):
+            track = TargetTrack(reported, 836, .95, (0, 800, 1000, 150), control,
+                                100, control, .4, 450, 550, 800, 950, 836)
+            actions = self.step(Observation(frequency=track, catch_present=True), now)
+        self.assertEqual([a.kind for a in actions], ["up"])
+        self.assertFalse(self.engine.linear_motion["catch_target"].speeds)
+
+    def test_tuning_near_midpoint_hysteresis_does_not_toggle_for_pixel_jitter(self):
+        region = (0, 800, 1000, 150)
+        for index, marker in enumerate((500, 499.5, 500, 500.5, 499.5, 500)):
+            actions = self.step(Observation(tuning=TuneTrack(500, marker, region, .99, 836)), 1 + index * .02)
+            self.assertEqual([a.kind for a in actions], ["up"])
+
+    def test_tuning_stale_observations_cannot_preserve_a_rightward_press(self):
+        region = (0, 800, 1000, 150)
+        self.step(Observation(tuning=TuneTrack(800, 700, region, .99, 836)), 1)
+        actions = self.engine.step(Observation(tuning=TuneTrack(800, 770, region, .99, 836)),
+                                   (1080, 1920, 3), 1.3, captured_at=1.05)
+        self.assertEqual([a.kind for a in actions], ["up"])
+
+    def test_start_and_pause_discard_old_catch_momentum(self):
+        self.steering_catch(500, 475, 1)
+        self.steering_catch(500, 485, 1.02)
+        self.engine.start(1.03)
+        self.assertEqual([a.kind for a in self.steering_catch(500, 485, 1.04)], ["down"])
+        self.steering_catch(500, 495, 1.06)
+        self.engine.pause()
+        self.engine.start(1.07)
+        self.assertEqual([a.kind for a in self.steering_catch(500, 485, 1.08)], ["down"])
+
+    def test_motion_steering_only_holds_or_releases_without_cursor_movement(self):
+        for target, control, now in ((500, 475, 1), (500, 485, 1.02), (530, 515, 1.04)):
+            actions = self.steering_catch(target, control, now)
+            self.assertTrue(all(a.kind in ("up", "down") and a.x == 0 and a.y == 0 for a in actions))
 
     def test_tuning_releases_button_if_marker_detection_is_lost(self):
         track = TuneTrack(1058, 435, (425, 800, 1060, 150), .99, 836)
@@ -367,6 +543,37 @@ class EngineChecks(unittest.TestCase):
         self.assertTrue(self.engine.error)
         self.assertIn("after the inventory key", self.engine.error)
         self.assertEqual(self.engine.caught, 10)
+
+    def test_disabled_autosell_does_not_open_inventory_when_count_is_due(self):
+        self.config["auto_sell"] = False
+        self.engine.caught = 10
+        actions = self.step(Observation(), 1)
+        self.assertEqual([a.kind for a in actions], ["down"])
+        self.assertEqual(self.engine.phase, "charge")
+        self.assertEqual(self.engine.caught, 10)
+
+    def test_disabled_autosell_waits_for_manual_inventory_close_without_input(self):
+        self.config["auto_sell"] = False
+        self.engine.caught = 10
+        button = Match(1420, 635, .99, (1380, 620, 80, 30))
+        for now in (1, 2, 3):
+            actions = self.step(Observation(sell=button), now)
+            self.assertEqual([a.kind for a in actions], ["up"])
+            self.assertEqual(self.engine.caught, 10)
+            self.assertEqual(self.engine.sold_batches, 0)
+
+    def test_disabled_autosell_cancels_every_pending_sale_phase_without_keys_or_clicks(self):
+        self.config["auto_sell"] = False
+        button = Match(1420, 635, .99, (1380, 620, 80, 30))
+        for phase in ("sell_open", "sell_first", "sell_confirm", "sell_finish"):
+            with self.subTest(phase=phase):
+                self.engine.phase = phase
+                self.engine.caught = 10
+                actions = self.step(Observation(sell=button, confirm=button), 1)
+                self.assertEqual([a.kind for a in actions], ["up"])
+                self.assertEqual(self.engine.phase, "idle")
+                self.assertEqual(self.engine.caught, 10)
+                self.assertEqual(self.engine.sold_batches, 0)
 
 
 if __name__ == "__main__":
